@@ -4,9 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    # Minor and patch updates arrive together; each major update gets its own
+    # pull request, so one breaking change cannot hold up the rest.
     groups:
       rust:
         patterns: ["*"]
+        update-types: [minor, patch]
   - package-ecosystem: github-actions
     directory: /
     schedule:

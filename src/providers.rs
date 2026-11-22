@@ -528,34 +528,76 @@ fn run_limited(command: &[String], timeout: Duration) -> Result<Vec<u8>, String>
 
 // --------------------------------------------------------------- Helpers ---
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(15))
-        .user_agent(concat!("copia/", env!("CARGO_PKG_VERSION")))
-        .build()
+/// A request Copia is about to make: a URL and a few headers. Kept as plain
+/// data so the HTTP library stays a detail of `send`.
+struct Request {
+    post: bool,
+    url: &'static str,
+    headers: Vec<(&'static str, String)>,
 }
 
-fn send(request: ureq::Request, body: Option<Value>) -> Result<Value, String> {
-    let result = match body {
-        Some(body) => request.send_json(body),
-        None => request.call(),
-    };
-    match result {
-        Ok(response) => response
-            .into_json()
-            .map_err(|e| format!("unreadable reply: {e}")),
-        Err(ureq::Error::Status(code, response)) => {
-            let text = response.into_string().unwrap_or_default();
-            let detail: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-            let detail: String = detail.chars().take(100).collect();
-            if detail.is_empty() || detail.starts_with('<') {
-                Err(format!("HTTP {code}"))
-            } else {
-                Err(format!("HTTP {code}: {detail}"))
-            }
-        }
-        Err(e) => Err(format!("network: {e}")),
+struct Http;
+
+fn agent() -> Http {
+    Http
+}
+
+impl Http {
+    fn get(self, url: &'static str) -> Request {
+        Request { post: false, url, headers: Vec::new() }
     }
+
+    fn post(self, url: &'static str) -> Request {
+        Request { post: true, url, headers: Vec::new() }
+    }
+}
+
+impl Request {
+    fn set(mut self, name: &'static str, value: &str) -> Self {
+        self.headers.push((name, value.to_string()));
+        self
+    }
+}
+
+fn send(request: Request, body: Option<Value>) -> Result<Value, String> {
+    let agent: ureq::Agent = ureq::Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(15)))
+        .user_agent(concat!("copia/", env!("CARGO_PKG_VERSION")))
+        // 4xx / 5xx come back as responses, so their bodies can be reported.
+        .http_status_as_error(false)
+        .build()
+        .into();
+
+    let result = if request.post {
+        let mut builder = agent.post(request.url);
+        for (name, value) in &request.headers {
+            builder = builder.header(*name, value.as_str());
+        }
+        builder.send_json(body.unwrap_or_else(|| json!({})))
+    } else {
+        let mut builder = agent.get(request.url);
+        for (name, value) in &request.headers {
+            builder = builder.header(*name, value.as_str());
+        }
+        builder.call()
+    };
+    let mut response = result.map_err(|e| format!("network: {e}"))?;
+
+    let code = response.status().as_u16();
+    if code >= 400 {
+        let text = response.body_mut().read_to_string().unwrap_or_default();
+        let detail: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let detail: String = detail.chars().take(100).collect();
+        return if detail.is_empty() || detail.starts_with('<') {
+            Err(format!("HTTP {code}"))
+        } else {
+            Err(format!("HTTP {code}: {detail}"))
+        };
+    }
+    response
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("unreadable reply: {e}"))
 }
 
 /// A 401 almost always means the CLI's token aged out; say how to fix it.
