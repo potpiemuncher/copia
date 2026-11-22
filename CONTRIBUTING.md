@@ -54,8 +54,15 @@ A provider is one function in `src/providers.rs` that returns
 
 ## Pull requests
 
-Small and focused is easiest to review. CI builds on macOS, Windows and Linux
-and runs the tests; please make sure `cargo test` passes first.
+`main` is protected: every change lands through a pull request, and the build
+must pass on macOS, Windows and Linux before it can merge. Small and focused
+is easiest to review; please make sure `cargo test` passes first.
+
+## Releases
+
+Maintainers release by setting the version in `Cargo.toml` and
+`tauri.conf.json`, merging, then pushing a tag such as `v0.2.0`. The `release`
+workflow builds the Windows, macOS and Linux installers and publishes them.
 
 By contributing you agree your work is released under the [MIT license](LICENSE)
 and that you will follow the [Code of Conduct](CODE_OF_CONDUCT.md).

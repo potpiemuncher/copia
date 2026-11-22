@@ -1,35 +1,129 @@
 # Copia
 
 [![build](https://github.com/potpiemuncher/copia/actions/workflows/build.yml/badge.svg)](https://github.com/potpiemuncher/copia/actions/workflows/build.yml)
+[![latest release](https://img.shields.io/github/v/release/potpiemuncher/copia)](https://github.com/potpiemuncher/copia/releases/latest)
 [![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 *cōpia* — Latin for plenty, supply, what you have on hand.
 
 A small menubar / system-tray app that shows how much of your AI coding
-subscriptions you have left. The tray icon is itself a tiny chart, one bar per
-tool. Click it and you get the same thing bigger: labelled vertical bars, one
-per quota window, filled to what remains.
+subscriptions you have left: Claude, Codex, Gemini and OpenCode Go. The tray
+icon is itself a tiny chart, one bar per tool. Click it and you get the same
+thing bigger: labelled vertical bars, one per quota window, filled to what
+remains.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/popover-dark.png">
+  <img src="docs/popover-light.png" width="612" alt="Copia's popover: vertical bars showing the share of each quota that is left for Claude, Codex and OpenCode Go, with reset times underneath, and a sign-in error for Gemini.">
+</picture>
+
+*The popover, shown with demo data. It follows your system's light or dark theme.*
+
+Free, open source (MIT), no account, no telemetry. Built with
+[Tauri 2](https://tauri.app).
+
+## Install
+
+| Your computer | Download |
+| --- | --- |
+| **Windows** 10 / 11 | [Copia-windows-x64-setup.exe](https://github.com/potpiemuncher/copia/releases/latest/download/Copia-windows-x64-setup.exe) |
+| **macOS** 11 or later, Apple silicon or Intel | [Copia-macos-universal.dmg](https://github.com/potpiemuncher/copia/releases/latest/download/Copia-macos-universal.dmg) |
+| **Linux** (Debian, Ubuntu, Mint…) | [Copia-linux-amd64.deb](https://github.com/potpiemuncher/copia/releases/latest/download/Copia-linux-amd64.deb) |
+| **Linux** (anything else) | [Copia-linux-amd64.AppImage](https://github.com/potpiemuncher/copia/releases/latest/download/Copia-linux-amd64.AppImage) |
+
+All downloads, with checksums, are on the
+[releases page](https://github.com/potpiemuncher/copia/releases/latest).
+
+The installers are **not code-signed yet**, so Windows and macOS will warn you
+the first time. The steps below include how to get past that.
+
+### Windows
+
+1. Download **Copia-windows-x64-setup.exe** and run it.
+2. If a blue "Windows protected your PC" box appears, click **More info**,
+   then **Run anyway**.
+3. Click through the installer.
+4. Start **Copia** from the Start menu. Its icon appears in the system tray,
+   by the clock; it may be tucked under the **^** arrow. Drag it onto the
+   taskbar to keep it visible.
+
+### macOS
+
+1. Download **Copia-macos-universal.dmg** and open it.
+2. Drag **Copia** onto the **Applications** folder.
+3. Open Applications, **right-click Copia** and choose **Open**, then **Open**
+   again in the dialog. If macOS still refuses, go to **System Settings →
+   Privacy & Security**, scroll down and click **Open Anyway**. You only do
+   this once.
+4. Copia's bars appear in the menubar, at the top right.
+5. If you use Claude Code, macOS asks whether Copia may read the
+   "Claude Code-credentials" Keychain item. Choose **Always Allow**, or it
+   will ask on every refresh.
+
+### Linux
+
+Debian, Ubuntu and relatives:
+
+```bash
+sudo apt install ./Copia-linux-amd64.deb
 ```
- COPIA  as of 4:51 PM                 [Refresh]
 
-  62%   39%  │   88%   13%  │
-  ▓▓    ░░   │   ▓▓    ░░   │
-  ▓▓    ░░   │   ▓▓    ░░   │
-  ▓▓    ▓▓   │   ▓▓    ░░   │
-  ▓▓    ▓▓   │   ▓▓    ▓▓   │
-  5h   week  │   5h   week  │
-   Claude    │     Codex    │   …
+Anything else, with the AppImage:
+
+```bash
+chmod +x Copia-linux-amd64.AppImage && ./Copia-linux-amd64.AppImage
 ```
 
-Built with [Tauri 2](https://tauri.app) (Rust + one HTML file), MIT licensed.
+Then start **Copia** from your application menu. On GNOME you need a tray
+extension such as *AppIndicator and KStatusNotifierItem Support* for the icon
+to show.
+
+### First run
+
+Copia does not sign you in to anything. It shows the tools whose own
+command-line app is already signed in **on this computer**:
+
+| To see | Be signed in with |
+| --- | --- |
+| Claude | [Claude Code](https://claude.com/claude-code) (`claude`) |
+| Codex / ChatGPT | [Codex CLI](https://github.com/openai/codex) (`codex`) |
+| Gemini | [Gemini CLI](https://github.com/google-gemini/gemini-cli) (`gemini`) |
+| OpenCode Go | [OpenCode](https://opencode.ai) (`opencode`), or set `OPENCODE_API_KEY` |
+
+If none are signed in, the popover says so. Sign in with one, then click
+**Refresh**.
+
+### Uninstall
+
+- **Windows:** Settings → Apps → Installed apps → Copia → Uninstall.
+- **macOS:** quit Copia from its menu, then drag it from Applications to the Bin.
+- **Linux:** `sudo apt remove copia`, or delete the AppImage.
+
+Copia stores nothing except an optional settings file (see [Settings](#settings)).
+
+## Using it
+
+- **Left click** the tray icon: show or hide the bars. Clicking anywhere else
+  hides them, as does Esc. Ctrl+R / ⌘R refreshes.
+- **Right click**: Show quotas / Refresh now / Quit. On Linux, where trays only
+  give apps a menu, this menu is the way in.
+- **The icon**: one bar per signed-in tool, filled to what is left of that
+  tool's *tightest* quota, so a nearly empty bar means "one of this tool's
+  limits is close". On macOS it is a template image that follows the menubar
+  colour; elsewhere bars are purple, amber below 50% and red below 20%.
+- Hover the icon for the numbers as text.
+- A provider marked **unverified** in the popover is one whose request or reply
+  code has not been run against a live account (currently OpenCode Go).
+- The popover follows the system light / dark theme, redraws its bars in
+  system colours under Windows High Contrast, and exposes each bar to screen
+  readers as a meter ("week: 39% left, resets in 3d").
 
 ## Status
 
 Early, and honest about it:
 
-- **Built and run on macOS only** (Apple silicon), with demo data. The tray
-  icon, the popover and its layout work there.
+- **Built and run on macOS only** (Apple silicon). The tray icon, the popover
+  and its layout work there.
 - **Claude and Codex have been fetched from live accounts** (22 Nov 2026).
   Claude returned its 5-hour and weekly windows; Codex returned one weekly
   window. **Gemini and OpenCode Go have not been tried against a real
@@ -38,7 +132,9 @@ Early, and honest about it:
 - **macOS fullscreen:** the popover did not come on screen while another app
   was in a fullscreen Space. It likely needs to become an `NSPanel` (see
   `tauri-nspanel`). Outside fullscreen it shows normally.
-- **Windows and Linux compile in CI but have not been run by anyone yet.**
+- **Windows and Linux installers are built and tested by CI, but nobody has
+  reported running them yet.** If you do, please
+  [say how it went](https://github.com/potpiemuncher/copia/issues/new/choose).
 
 ## What it reads
 
@@ -78,7 +174,42 @@ Things to know:
 
 A tool you are not signed in to is simply left out.
 
-## Run it
+## Settings
+
+Optional. `config.json` in `~/Library/Application Support/copia/` (macOS),
+`~/.config/copia/` (Linux) or `%APPDATA%\copia\` (Windows). It is re-read on
+every refresh.
+
+```json
+{
+  "refresh_minutes": 5,
+  "disabled": ["gemini"],
+  "custom": [
+    { "name": "My tool", "command": ["/path/to/script"] }
+  ]
+}
+```
+
+Provider ids for `disabled`: `claude`, `codex`, `gemini`, `opencode-go`.
+
+A **custom** provider is any program that prints quotas as JSON, with `used` or
+`remaining` as a fraction from 0 to 1 and `resets_at` as epoch seconds or an
+ISO-8601 time:
+
+```json
+[
+  { "label": "day", "remaining": 0.4, "resets_at": "2026-11-23T00:00:00Z" },
+  { "label": "month", "used": 0.15 }
+]
+```
+
+A custom command gets 15 seconds and 1 MB of output; past either it is stopped
+and its bar shows why. Because these commands run on every refresh, on macOS
+and Linux Copia runs them only when `config.json` and its folder belong to you
+and cannot be written by group or others (`chmod go-w`); otherwise it skips
+them and says so in the popover.
+
+## Build from source
 
 You need [Rust](https://rustup.rs). On Linux also the Tauri system libraries:
 
@@ -115,57 +246,12 @@ cargo install tauri-cli --version "^2" --locked
 cargo tauri build
 ```
 
-## Using it
+## Getting help
 
-- **Left click** the tray icon: show or hide the bars. Clicking anywhere else
-  hides them, as does Esc. Ctrl+R / ⌘R refreshes.
-- **Right click**: Show quotas / Refresh now / Quit. On Linux, where trays only
-  give apps a menu, this menu is the way in.
-- **The icon**: one bar per signed-in tool, filled to what is left of that
-  tool's *tightest* quota, so a nearly empty bar means "one of this tool's
-  limits is close". On macOS it is a template image that follows the menubar
-  colour; elsewhere bars are purple, amber below 50% and red below 20%.
-- Hover the icon for the numbers as text.
-- A provider marked **unverified** in the popover is one whose request or reply
-  code has not been run against a live account (currently OpenCode Go).
-- The popover follows the system light / dark theme, redraws its bars in
-  system colours under Windows High Contrast, and exposes each bar to screen
-  readers as a meter ("week: 39% left, resets in 3d").
-
-## Settings
-
-Optional. `config.json` in `~/Library/Application Support/copia/` (macOS),
-`~/.config/copia/` (Linux) or `%APPDATA%\copia\` (Windows). It is re-read on
-every refresh.
-
-```json
-{
-  "refresh_minutes": 5,
-  "disabled": ["gemini"],
-  "custom": [
-    { "name": "My tool", "command": ["/path/to/script"] }
-  ]
-}
-```
-
-Provider ids for `disabled`: `claude`, `codex`, `gemini`, `opencode-go`.
-
-A **custom** provider is any program that prints quotas as JSON, with `used` or
-`remaining` as a fraction from 0 to 1 and `resets_at` as epoch seconds or an
-ISO-8601 time:
-
-```json
-[
-  { "label": "day", "remaining": 0.4, "resets_at": "2026-11-23T00:00:00Z" },
-  { "label": "month", "used": 0.15 }
-]
-```
-
-A custom command gets 15 seconds and 1 MB of output; past either it is stopped
-and its bar shows why. Because these commands run on every refresh, on macOS
-and Linux Copia runs them only when `config.json` and its folder belong to you
-and cannot be written by group or others (`chmod go-w`); otherwise it skips
-them and says so in the popover.
+- Something broken, or a number looks wrong:
+  [open an issue](https://github.com/potpiemuncher/copia/issues/new/choose).
+- Anything else: **support@pulsarit.ca**.
+- Security problems: see [SECURITY.md](SECURITY.md).
 
 ## Layout
 

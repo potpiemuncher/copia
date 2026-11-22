@@ -7,7 +7,7 @@ about how it handles them are taken seriously.
 
 Please report privately through
 [GitHub's private vulnerability reporting](https://github.com/potpiemuncher/copia/security/advisories/new)
-rather than a public issue. Include what you found, how to reproduce it, and
+or by email to **support@pulsarit.ca**, rather than a public issue. Include what you found, how to reproduce it, and
 the version or commit. Never include a real token.
 
 This is a one-maintainer project with no guaranteed response time; you should

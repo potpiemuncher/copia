@@ -1,0 +1,96 @@
+name: release
+# Builds the installers for every platform. On a v* tag it also publishes them
+# as a GitHub release. A pull request that touches this file builds the
+# installers without publishing, so changes here are tested before they merge.
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+    paths: [".github/workflows/release.yml", "tauri.conf.json"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  bundle:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows
+            os: windows-latest
+            args: --bundles nsis
+          - name: macos
+            os: macos-latest
+            args: --target universal-apple-darwin --bundles app
+          - name: linux
+            os: ubuntu-22.04
+            args: --bundles deb,appimage
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - name: Linux libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev libssl-dev build-essential libfuse2 file
+      - name: Both Mac architectures
+        if: runner.os == 'macOS'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - run: cargo install tauri-cli --version "^2" --locked
+      - run: cargo tauri build ${{ matrix.args }}
+
+      # Collect the installers under names that do not change between
+      # versions, so links to releases/latest/download/<name> keep working.
+      - name: Collect (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir out
+          cp target/release/bundle/nsis/*-setup.exe out/Copia-windows-x64-setup.exe
+      - name: Collect (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir out dmgroot
+          cp -R target/universal-apple-darwin/release/bundle/macos/Copia.app dmgroot/
+          ln -s /Applications dmgroot/Applications
+          lipo -archs dmgroot/Copia.app/Contents/MacOS/*
+          hdiutil create -volname Copia -srcfolder dmgroot -ov -format UDZO out/Copia-macos-universal.dmg
+          hdiutil verify out/Copia-macos-universal.dmg
+      - name: Collect (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir out
+          cp target/release/bundle/deb/*.deb out/Copia-linux-amd64.deb
+          cp target/release/bundle/appimage/*.AppImage out/Copia-linux-amd64.AppImage
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: installers-${{ matrix.name }}
+          path: out/*
+          if-no-files-found: error
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: bundle
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: installers-*
+          merge-multiple: true
+          path: out
+      - name: Checksums
+        run: cd out && sha256sum Copia-* > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --verify-tag --title "Copia ${TAG#v}" --generate-notes
+          gh release upload "$TAG" out/* --repo "$GITHUB_REPOSITORY" --clobber

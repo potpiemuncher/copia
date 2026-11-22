@@ -9,5 +9,6 @@
   or add it yourself as a custom command (see the README's Settings section).
 - **A security problem:** see [SECURITY.md](SECURITY.md); please do not open a
   public issue.
+- **Anything else:** email **support@pulsarit.ca**.
 
 This is a spare-time project, so replies may take a few days.
