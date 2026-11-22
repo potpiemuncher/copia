@@ -24,7 +24,7 @@ html, body { margin: 0; background: var(--bg); color: var(--ink); overflow: hidd
 body {
   font: .8125rem/1.35 system-ui, -apple-system, "Segoe UI", sans-serif;
   display: flex; flex-direction: column;
-  width: max-content; min-width: 13rem; max-width: 55rem; max-height: 600px;
+  width: max-content; min-width: 15rem; max-width: 55rem; max-height: 600px;
   padding: .75rem .875rem .625rem; user-select: none; cursor: default;
 }
 header { display: flex; align-items: center; gap: .5rem; margin-bottom: .75rem; }
@@ -86,7 +86,9 @@ main { min-height: 0; overflow: hidden auto; scrollbar-width: thin; scrollbar-co
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 5; overflow: hidden;
 }
 #empty { margin: 0; color: var(--muted); max-width: 16rem; }
+/* The footnote wraps to the width the bars need; it never widens the popover. */
 footer {
+  width: 0; min-width: 100%;
   margin-top: .625rem; padding-top: .45rem; border-top: 1px solid var(--line);
   color: var(--muted); font-size: .6875rem;
 }
