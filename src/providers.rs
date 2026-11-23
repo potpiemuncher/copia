@@ -45,9 +45,11 @@ pub struct Config {
     /// Provider ids to skip: "claude", "codex", "gemini", "opencode-go".
     pub disabled: Vec<String>,
     pub custom: Vec<Custom>,
-    /// Why `custom` was dropped: config.json could be changed by someone else.
+    /// Why config.json, or its `custom` part, was not used: it could not be
+    /// read or parsed, or it could be changed by someone else. Shown in the
+    /// popover so a typo does not silently drop every setting.
     #[serde(skip)]
-    pub refused: Option<String>,
+    pub problem: Option<String>,
 }
 
 #[derive(Deserialize, Clone)]
@@ -63,48 +65,79 @@ impl Config {
     }
 
     pub fn load() -> Config {
-        let Some(path) = Self::path() else {
-            return Config::default();
+        match Self::path() {
+            Some(path) => Self::load_from(&path),
+            None => Config::default(),
+        }
+    }
+
+    fn load_from(path: &std::path::Path) -> Config {
+        use std::io::Read;
+        let trouble = |why: String| Config { problem: Some(why), ..Config::default() };
+
+        // Read and check one open handle, so the file that is checked is the
+        // file that was read even if the path is swapped in between.
+        let mut file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Config::default(),
+            Err(e) => return trouble(format!("config.json could not be read: {e}")),
         };
-        let mut config: Config = read_json(path.clone())
-            .and_then(|v| serde_json::from_value(v).ok())
-            .unwrap_or_default();
+        let mut bytes = Vec::new();
+        if let Err(e) = file.read_to_end(&mut bytes) {
+            return trouble(format!("config.json could not be read: {e}"));
+        }
+        if bytes.iter().all(u8::is_ascii_whitespace) {
+            return Config::default();
+        }
+        let mut config: Config = match serde_json::from_slice(&bytes) {
+            Ok(config) => config,
+            Err(e) => return trouble(format!("config.json ignored: {e}")),
+        };
         // Custom commands run every few minutes, so only take them from a
         // file that nobody but this user (or root) can change.
         if !config.custom.is_empty() {
-            if let Err(why) = check_private(&path) {
+            if let Err(why) = check_private(path, &file) {
                 config.custom.clear();
-                config.refused = Some(format!("custom commands not run: {why}"));
+                config.problem = Some(format!("custom commands not run: {why}"));
             }
         }
         config
     }
 }
 
-/// Ok when `path` (after following links) and the folder it is in are owned
-/// by this user or root and cannot be written by group or others.
+/// Ok when the open `file`, the folder `path` names it in, and the folder it
+/// really lives in (after following links) are all owned by this user or root
+/// and cannot be written by group or others.
 #[cfg(unix)]
-fn check_private(path: &std::path::Path) -> Result<(), String> {
+fn check_private(path: &std::path::Path, file: &std::fs::File) -> Result<(), String> {
     use std::os::unix::fs::MetadataExt;
-    let real = std::fs::canonicalize(path).map_err(|e| format!("config.json: {e}"))?;
-    let folder = real.parent().ok_or("config.json has no folder")?;
     // SAFETY: getuid has no preconditions and cannot fail.
     let me = unsafe { libc::getuid() };
-    for (what, at) in [("config.json", real.as_path()), ("its folder", folder)] {
-        let meta = std::fs::metadata(at).map_err(|e| format!("{what}: {e}"))?;
+    let private = |what: &str, meta: std::fs::Metadata| {
         if meta.uid() != me && meta.uid() != 0 {
             return Err(format!("{what} belongs to another user"));
         }
         if meta.mode() & 0o022 != 0 {
             return Err(format!("{what} can be changed by other users (chmod go-w)"));
         }
+        Ok(())
+    };
+    private("config.json", file.metadata().map_err(|e| format!("config.json: {e}"))?)?;
+
+    let named = path.parent().ok_or("config.json has no folder")?;
+    let real = std::fs::canonicalize(path).map_err(|e| format!("config.json: {e}"))?;
+    let real = real.parent().ok_or("config.json has no folder")?;
+    for folder in [named, real] {
+        // Name the folder: with a linked config.json there are two of them.
+        let what = format!("its folder {}", folder.display());
+        private(&what, std::fs::metadata(folder).map_err(|e| format!("{what}: {e}"))?)?;
     }
     Ok(())
 }
 
 /// Windows: the per-user %APPDATA% folder is private by default.
 #[cfg(not(unix))]
-fn check_private(_path: &std::path::Path) -> Result<(), String> {
+fn check_private(_path: &std::path::Path, _file: &std::fs::File) -> Result<(), String> {
     Ok(())
 }
 
@@ -131,12 +164,20 @@ pub fn fetch_all(config: &Config) -> Vec<Provider> {
             jobs.push((id.to_string(), name.to_string(), scope.spawn(fetch)));
         }
         for custom in &config.custom {
-            let id = format!("custom:{}", custom.name);
+            // Ids must be unique (the popover keys its bars on them), even
+            // when two entries share a name.
+            let base = format!("custom:{}", custom.name);
+            let mut id = base.clone();
+            let mut n = 1;
+            while jobs.iter().any(|(taken, _, _)| *taken == id) {
+                n += 1;
+                id = format!("{base}#{n}");
+            }
             jobs.push((id, custom.name.clone(), scope.spawn(|| run_custom(custom))));
         }
-        let refused = config.refused.clone().map(|error| Provider {
-            id: "custom".into(),
-            name: "Custom".into(),
+        let problem = config.problem.clone().map(|error| Provider {
+            id: "config".into(),
+            name: "Settings".into(),
             configured: true,
             quotas: Vec::new(),
             error: Some(error),
@@ -156,7 +197,7 @@ pub fn fetch_all(config: &Config) -> Vec<Provider> {
                 let experimental = EXPERIMENTAL.contains(&id.as_str());
                 Provider { id, name, configured, quotas, error, experimental }
             })
-            .chain(refused)
+            .chain(problem)
             .collect()
     })
 }
@@ -208,7 +249,16 @@ pub fn demo() -> Vec<Provider> {
 // ---------------------------------------------------------------- Claude ---
 
 fn claude() -> Fetched {
-    let creds = claude_keychain().or_else(|| read_json(dirs::home_dir()?.join(".claude/.credentials.json")));
+    let file = || read_json(dirs::home_dir()?.join(".claude/.credentials.json"));
+    let creds = match claude_keychain() {
+        Ok(Some(creds)) => Some(creds),
+        Ok(None) => file(),
+        // Keychain refused: the file may still have a login; if not, say so.
+        Err(why) => match file() {
+            Some(creds) => Some(creds),
+            None => return Err(why),
+        },
+    };
     let token = match creds
         .as_ref()
         .and_then(|c| c.pointer("/claudeAiOauth/accessToken"))
@@ -251,25 +301,55 @@ fn claude() -> Fetched {
 /// Security.framework, so macOS asks on Copia's behalf and an "Always Allow"
 /// trusts Copia's own binary. (Running `/usr/bin/security` instead would make
 /// that approval cover every program that can run `security`.)
+///
+/// If the person clicks Deny, asking again on every timed refresh would bring
+/// the dialog back every few minutes, so Copia stops asking until they press
+/// Refresh (see `ask_keychain_again`).
 #[cfg(target_os = "macos")]
-fn claude_keychain() -> Option<Value> {
+fn claude_keychain() -> Result<Option<Value>, String> {
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
-    let found = ItemSearchOptions::new()
+    use std::sync::atomic::Ordering;
+    const DENIED: &str = "Keychain access denied — press Refresh to be asked again";
+    // errSecUserCanceled, errSecAuthFailed: the person said no.
+    const REFUSALS: [i32; 2] = [-128, -25293];
+
+    if KEYCHAIN_DENIED.load(Ordering::Relaxed) {
+        return Err(DENIED.into());
+    }
+    let found = match ItemSearchOptions::new()
         .class(ItemClass::generic_password())
         .service("Claude Code-credentials")
         .load_data(true)
         .limit(1)
         .search()
-        .ok()?;
-    match found.into_iter().next()? {
-        SearchResult::Data(data) => serde_json::from_slice(&data).ok(),
+    {
+        Ok(found) => found,
+        Err(e) if REFUSALS.contains(&e.code()) => {
+            KEYCHAIN_DENIED.store(true, Ordering::Relaxed);
+            return Err(DENIED.into());
+        }
+        // Not found, locked, no UI available…: try the file instead.
+        Err(_) => return Ok(None),
+    };
+    Ok(match found.into_iter().next() {
+        Some(SearchResult::Data(data)) => serde_json::from_slice(&data).ok(),
         _ => None,
-    }
+    })
 }
 
 #[cfg(not(target_os = "macos"))]
-fn claude_keychain() -> Option<Value> {
-    None
+fn claude_keychain() -> Result<Option<Value>, String> {
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+static KEYCHAIN_DENIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The person asked for a refresh: if they once denied Keychain access, let
+/// the next fetch ask again.
+pub fn ask_keychain_again() {
+    #[cfg(target_os = "macos")]
+    KEYCHAIN_DENIED.store(false, std::sync::atomic::Ordering::Relaxed);
 }
 
 // ----------------------------------------------------------------- Codex ---
@@ -437,7 +517,11 @@ fn opencode_go_quotas(reply: &Value) -> Vec<Quota> {
 /// its stdout — either `[{label, used | remaining, resets_at?}]` or
 /// `{"quotas": [...]}`, with `used` / `remaining` as 0–1 fractions.
 fn run_custom(custom: &Custom) -> Fetched {
-    let stdout = run_limited(&custom.command, CUSTOM_TIMEOUT)?;
+    use std::io::IsTerminal;
+    // In a terminal (`copia --print`), leave the command in the terminal's
+    // process group; see `run_limited`.
+    let own_group = !std::io::stdin().is_terminal();
+    let stdout = run_limited(&custom.command, CUSTOM_TIMEOUT, own_group)?;
     let reply: Value =
         serde_json::from_slice(&stdout).map_err(|e| format!("output is not JSON: {e}"))?;
     let list = match &reply["quotas"] {
@@ -468,20 +552,29 @@ const CUSTOM_MAX_OUTPUT: u64 = 1024 * 1024;
 
 /// Run `command` and return its stdout, killing it if it runs past `timeout`
 /// or prints more than `CUSTOM_MAX_OUTPUT` bytes.
-fn run_limited(command: &[String], timeout: Duration) -> Result<Vec<u8>, String> {
+///
+/// `own_group`: on Unix, run it in a process group of its own so that
+/// stopping it also stops anything it started (otherwise a background child
+/// keeps the stdout pipe, and the reader thread below, alive). Pass false when
+/// Copia runs in a terminal, so Ctrl-C still reaches the command and it can
+/// still prompt on the terminal (ssh, gpg…). Windows always uses a Job Object.
+fn run_limited(command: &[String], timeout: Duration, own_group: bool) -> Result<Vec<u8>, String> {
     use std::io::Read;
     use std::process::Stdio;
     use std::sync::mpsc;
 
     let (program, args) = command.split_first().ok_or("empty command")?;
     let deadline = std::time::Instant::now() + timeout;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(|e| format!("could not run {program}: {e}"))?;
+    let mut builder = Command::new(program);
+    builder.args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(unix)]
+    if own_group {
+        std::os::unix::process::CommandExt::process_group(&mut builder, 0);
+    }
+    #[cfg(not(unix))]
+    let _ = own_group;
+    let mut child = builder.spawn().map_err(|e| format!("could not run {program}: {e}"))?;
+    let tree = tree::Tree::adopt(&child, own_group);
 
     // Read stdout on its own thread so the deadline holds even while the
     // command is still printing (or keeps the pipe open and prints nothing).
@@ -494,7 +587,7 @@ fn run_limited(command: &[String], timeout: Duration) -> Result<Vec<u8>, String>
     });
 
     let stop = |child: &mut std::process::Child, why: String| {
-        let _ = child.kill();
+        tree.kill(child);
         let _ = child.wait();
         Err(why)
     };
@@ -524,6 +617,92 @@ fn run_limited(command: &[String], timeout: Duration) -> Result<Vec<u8>, String>
         return Err(format!("{program} exited with {status}"));
     }
     Ok(stdout)
+}
+
+/// A custom command together with everything it starts, so all of it can be
+/// stopped at once, even after the command itself has exited.
+mod tree {
+    use std::process::Child;
+
+    /// Unix: the process group the command leads (see `run_limited`). The
+    /// group id stays reserved until the leader is reaped, which `stop` does
+    /// only after killing the group.
+    #[cfg(unix)]
+    pub struct Tree(Option<libc::pid_t>);
+
+    #[cfg(unix)]
+    impl Tree {
+        pub fn adopt(child: &Child, own_group: bool) -> Tree {
+            Tree(own_group.then(|| libc::pid_t::try_from(child.id()).ok()).flatten())
+        }
+
+        pub fn kill(&self, child: &mut Child) {
+            if let Some(pid) = self.0 {
+                // SAFETY: kill has no memory-safety preconditions. A
+                // negative pid names the process group `run_limited` made.
+                unsafe { libc::kill(-pid, libc::SIGKILL) };
+            }
+            let _ = child.kill();
+        }
+    }
+
+    /// Windows: a Job Object. Processes the command starts join it too, and
+    /// it can be terminated after the command itself has exited.
+    #[cfg(windows)]
+    pub struct Tree(Option<Job>);
+
+    #[cfg(windows)]
+    struct Job(*mut std::ffi::c_void);
+
+    // SAFETY: a job handle is a kernel handle, usable from any thread.
+    #[cfg(windows)]
+    unsafe impl Send for Job {}
+    #[cfg(windows)]
+    unsafe impl Sync for Job {}
+
+    #[cfg(windows)]
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn CreateJobObjectW(attributes: *mut std::ffi::c_void, name: *const u16) -> *mut std::ffi::c_void;
+        fn AssignProcessToJobObject(job: *mut std::ffi::c_void, process: *mut std::ffi::c_void) -> i32;
+        fn TerminateJobObject(job: *mut std::ffi::c_void, exit_code: u32) -> i32;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+    }
+
+    #[cfg(windows)]
+    impl Tree {
+        pub fn adopt(child: &Child, _own_group: bool) -> Tree {
+            use std::os::windows::io::AsRawHandle;
+            // SAFETY: null attributes and name ask for an unnamed job with
+            // default security; the handle is checked before use.
+            let job = unsafe { CreateJobObjectW(std::ptr::null_mut(), std::ptr::null()) };
+            if job.is_null() {
+                return Tree(None);
+            }
+            let job = Job(job);
+            // SAFETY: both handles are valid and open for this call. (A
+            // process the command starts in the instant before this joins
+            // no job; that window is microseconds wide.)
+            let joined = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle() as _) } != 0;
+            Tree(joined.then_some(job))
+        }
+
+        pub fn kill(&self, child: &mut Child) {
+            if let Some(job) = &self.0 {
+                // SAFETY: the job handle is open until `Job` is dropped.
+                unsafe { TerminateJobObject(job.0, 1) };
+            }
+            let _ = child.kill();
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for Job {
+        fn drop(&mut self) {
+            // SAFETY: closed once, here; nothing uses the handle afterwards.
+            unsafe { CloseHandle(self.0) };
+        }
+    }
 }
 
 // --------------------------------------------------------------- Helpers ---
@@ -656,20 +835,20 @@ mod tests {
 
     #[test]
     fn custom_command_output_is_read() {
-        let out = run_limited(&cmd(&["/bin/echo", "[1]"]), Duration::from_secs(5)).unwrap();
+        let out = run_limited(&cmd(&["/bin/echo", "[1]"]), Duration::from_secs(5), true).unwrap();
         assert_eq!(out, b"[1]\n");
     }
 
     #[test]
     fn custom_command_failure_is_reported() {
-        let err = run_limited(&cmd(&["/usr/bin/false"]), Duration::from_secs(5)).unwrap_err();
+        let err = run_limited(&cmd(&["/usr/bin/false"]), Duration::from_secs(5), true).unwrap_err();
         assert!(err.contains("exited with"), "{err}");
     }
 
     #[test]
     fn custom_command_that_hangs_is_killed() {
         let started = Instant::now();
-        let err = run_limited(&cmd(&["/bin/sleep", "30"]), Duration::from_secs(1)).unwrap_err();
+        let err = run_limited(&cmd(&["/bin/sleep", "30"]), Duration::from_secs(1), true).unwrap_err();
         assert!(err.contains("took longer"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
@@ -678,14 +857,47 @@ mod tests {
     fn custom_command_that_closes_stdout_but_keeps_running_is_killed() {
         let started = Instant::now();
         let command = cmd(&["/bin/sh", "-c", "exec >&-; sleep 30"]);
-        let err = run_limited(&command, Duration::from_secs(1)).unwrap_err();
+        let err = run_limited(&command, Duration::from_secs(1), true).unwrap_err();
         assert!(err.contains("took longer"), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
+    fn custom_command_background_child_is_killed_too() {
+        let dir = std::env::temp_dir().join(format!("copia-tree-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("pid");
+        // The background sleep inherits stdout, as a careless script's would.
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let started = Instant::now();
+        let err = run_limited(&cmd(&["/bin/sh", "-c", &script]), Duration::from_secs(1), true).unwrap_err();
+        assert!(err.contains("took longer"), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_file).unwrap().trim().parse().unwrap();
+        // A killed process can linger as a zombie where nothing reaps
+        // orphans (a container without an init); that counts as gone.
+        let zombie = || {
+            Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).trim_start().starts_with('Z'))
+        };
+        let gone = (0..50).any(|_| {
+            // SAFETY: signal 0 only asks whether the process exists.
+            let alive = unsafe { libc::kill(pid, 0) } == 0 && !zombie();
+            if alive {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            !alive
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(gone, "background child {pid} outlived the command");
+    }
+
+    #[test]
     fn custom_command_that_floods_stdout_is_stopped() {
-        let err = run_limited(&cmd(&["/usr/bin/yes"]), Duration::from_secs(10)).unwrap_err();
+        let err = run_limited(&cmd(&["/usr/bin/yes"]), Duration::from_secs(10), true).unwrap_err();
         assert!(err.contains("more than 1 MB"), "{err}");
     }
 
@@ -697,19 +909,70 @@ mod tests {
         std::fs::write(&file, "{}").unwrap();
         let mode = |p: &std::path::Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
 
+        let check = |p: &std::path::Path| check_private(p, &std::fs::File::open(p).unwrap());
+
         mode(&dir, 0o700);
         mode(&file, 0o600);
-        assert_eq!(check_private(&file), Ok(()));
+        assert_eq!(check(&file), Ok(()));
 
         mode(&file, 0o666);
-        assert!(check_private(&file).unwrap_err().starts_with("config.json"));
+        assert!(check(&file).unwrap_err().starts_with("config.json"));
 
         mode(&file, 0o600);
         mode(&dir, 0o777);
-        assert!(check_private(&file).unwrap_err().starts_with("its folder"));
+        assert!(check(&file).unwrap_err().starts_with("its folder"));
+
+        // A link in a writable folder is refused even if its target is safe.
+        let safe = dir.join("safe");
+        std::fs::create_dir_all(&safe).unwrap();
+        mode(&safe, 0o700);
+        let target = safe.join("config.json");
+        std::fs::write(&target, "{}").unwrap();
+        mode(&target, 0o600);
+        let link = dir.join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(check(&link).unwrap_err().starts_with("its folder"));
 
         mode(&dir, 0o700);
+        assert_eq!(check(&link), Ok(()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn bad_config_is_reported_not_ignored() {
+        let dir = std::env::temp_dir().join(format!("copia-bad-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.json");
+
+        assert!(Config::load_from(&file).problem.is_none(), "a missing file is fine");
+
+        std::fs::write(&file, "  \n").unwrap();
+        assert!(Config::load_from(&file).problem.is_none(), "an empty file is fine");
+
+        std::fs::write(&file, r#"{ "refresh_minutes": 10, }"#).unwrap();
+        let config = Config::load_from(&file);
+        assert!(config.problem.unwrap().starts_with("config.json ignored"));
+
+        std::fs::write(&file, r#"{ "custom": [{ "command": ["x"] }] }"#).unwrap();
+        assert!(Config::load_from(&file).problem.unwrap().contains("name"));
+
+        std::fs::write(&file, r#"{ "refresh_minutes": 10, "disabled": ["gemini"] }"#).unwrap();
+        let config = Config::load_from(&file);
+        assert!(config.problem.is_none());
+        assert_eq!((config.refresh_minutes, config.disabled), (Some(10), vec!["gemini".to_string()]));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn custom_providers_with_the_same_name_get_distinct_ids() {
+        let custom = |name: &str| Custom { name: name.into(), command: cmd(&["/bin/echo", "[]"]) };
+        let config = Config {
+            disabled: ["claude", "codex", "gemini", "opencode-go"].map(String::from).to_vec(),
+            custom: vec![custom("Team"), custom("Team"), custom("Other")],
+            ..Config::default()
+        };
+        let ids: Vec<String> = fetch_all(&config).into_iter().map(|p| p.id).collect();
+        assert_eq!(ids, ["custom:Team", "custom:Team#2", "custom:Other"]);
     }
 }
 

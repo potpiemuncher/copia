@@ -58,7 +58,8 @@ the first time. The steps below include how to get past that.
 4. Copia's bars appear in the menubar, at the top right.
 5. If you use Claude Code, macOS asks whether Copia may read the
    "Claude Code-credentials" Keychain item. Choose **Always Allow**, or it
-   will ask on every refresh.
+   will ask on every refresh. If you choose **Deny**, Copia stops asking
+   until you press **Refresh**.
 
 ### Linux
 
@@ -169,7 +170,8 @@ is sent only to the vendor it belongs to.
 Things to know:
 
 - On macOS the first Claude fetch makes the system ask whether Copia may read
-  the Keychain item. Choose *Always Allow* or it asks every refresh. The
+  the Keychain item. Choose *Always Allow* or it asks every refresh (after a
+  *Deny* it waits until you press Refresh). The
   approval is for Copia's own signed app only, so a rebuilt development binary
   asks again. (Versions before this one asked on behalf of `/usr/bin/security`,
   which let any program read the token. If you allowed that, remove `security`
@@ -194,7 +196,8 @@ A tool you are not signed in to is simply left out.
 
 Optional. `config.json` in `~/Library/Application Support/copia/` (macOS),
 `~/.config/copia/` (Linux) or `%APPDATA%\copia\` (Windows). It is re-read on
-every refresh.
+every refresh. If it cannot be read or is not valid JSON, Copia uses the
+defaults and shows the reason under **Settings** in the popover.
 
 ```json
 {
@@ -251,6 +254,11 @@ as JSON (no tokens are printed):
 ```bash
 cargo run --release -- --print
 ```
+
+An installed copy takes the same flag. On Windows, run it from the folder
+Copia is installed in (the installer does not add it to `PATH`); the prompt
+can come back before the output appears, so use `start /wait Copia.exe --print`
+in cmd or `.\Copia.exe --print | Out-Host` in PowerShell to wait for it.
 
 To make an installable app (`.app`/`.dmg`, `.msi`, `.deb`/`.AppImage`):
 

@@ -11,7 +11,7 @@ const el = (tag, cls, text) => {
 let last = null;
 let lastFit = "";
 let announcedAt = null;
-const levels = new Map(); // "provider/label" -> fraction left shown last time
+const levels = new Map(); // "provider/index/label" -> fraction left shown last time
 
 // "resets_at" is epoch seconds or an ISO string; say how long from now.
 function until(resetsAt) {
@@ -39,7 +39,7 @@ function alertIcon() {
   return svg;
 }
 
-function quotaBar(provider, q, snap, settle) {
+function quotaBar(provider, q, i, snap, settle) {
   const left = Math.max(0, Math.min(1, 1 - q.used));
   const pct = Math.round(left * 100);
   const reset = until(q.resets_at);
@@ -56,7 +56,8 @@ function quotaBar(provider, q, snap, settle) {
 
   // A known quota always shows at least a sliver.
   const level = Math.max(left, 0.02);
-  const key = provider.id + "/" + q.label;
+  // The position too: a custom command may repeat (or leave out) labels.
+  const key = provider.id + "/" + i + "/" + q.label;
   const fill = el("div", "fill");
   fill.style.setProperty("--level", levels.get(key) ?? level);
   settle.push(() => fill.style.setProperty("--level", level));
@@ -93,7 +94,7 @@ function render(snap) {
       group.append(trouble);
     } else {
       const bars = el("div", "bars");
-      bars.append(...p.quotas.map(q => quotaBar(p, q, snap, settle)));
+      bars.append(...p.quotas.map((q, i) => quotaBar(p, q, i, snap, settle)));
       group.append(bars);
     }
     return group;

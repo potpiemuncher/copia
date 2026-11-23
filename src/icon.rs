@@ -26,7 +26,7 @@ const MAX_BARS: usize = 6;
 pub fn render(levels: &[Option<f64>], template: bool) -> (Vec<u8>, u32, u32) {
     let placeholder = [None, None, None];
     let levels = if levels.is_empty() { &placeholder[..] } else { levels };
-    let levels = &levels[..levels.len().min(MAX_BARS)];
+    let levels = &tightest(levels);
 
     let n = levels.len() as u32;
     let width = PAD * 2 + n * BAR + (n - 1) * GAP;
@@ -66,6 +66,23 @@ pub fn render(levels: &[Option<f64>], template: bool) -> (Vec<u8>, u32, u32) {
     (rgba, width, HEIGHT)
 }
 
+/// At most `MAX_BARS` levels, in their original order. When there are more,
+/// the ones with the least left are kept (unknown counts as plenty), so a
+/// provider that is running out never drops off the icon.
+fn tightest(levels: &[Option<f64>]) -> Vec<Option<f64>> {
+    if levels.len() <= MAX_BARS {
+        return levels.to_vec();
+    }
+    let mut order: Vec<usize> = (0..levels.len()).collect();
+    order.sort_by(|&a, &b| {
+        let key = |i: usize| levels[i].unwrap_or(f64::INFINITY);
+        key(a).total_cmp(&key(b))
+    });
+    order.truncate(MAX_BARS);
+    order.sort_unstable();
+    order.into_iter().map(|i| levels[i]).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +103,19 @@ mod tests {
         assert_eq!(column(1), (HEIGHT - 2 * PAD) / 2); // half
         assert_eq!(column(2), 2); // empty but known: a sliver
         assert_eq!(column(3), 0); // unknown: track only
+    }
+
+    #[test]
+    fn too_many_providers_keep_the_tightest_bars() {
+        let mut levels = vec![Some(0.9); MAX_BARS];
+        levels.insert(2, None);
+        levels.push(Some(0.05));
+        let kept = tightest(&levels);
+        assert_eq!(kept.len(), MAX_BARS);
+        assert_eq!(kept.last(), Some(&Some(0.05)), "the nearly-empty one is drawn");
+        assert!(!kept.contains(&None), "an unknown one gives way first");
+        let (_, width, _) = render(&levels, true);
+        assert_eq!(width, PAD * 2 + MAX_BARS as u32 * BAR + (MAX_BARS as u32 - 1) * GAP);
     }
 
     #[test]

@@ -52,8 +52,16 @@ struct Shared {
     snapshot: Mutex<Snapshot>,
     refresh: Mutex<mpsc::Sender<()>>,
     anchor: Mutex<Option<Anchor>>,
+    /// The popover's size in logical pixels, as last asked for by `fit`.
+    /// Placement works from this rather than the window's current size,
+    /// which can lag behind (GTK resizes asynchronously; Windows rescales a
+    /// window after it moves to a monitor with another scale factor).
+    size: Mutex<(f64, f64)>,
     hidden_at: Mutex<Instant>,
 }
+
+/// The starting size in tauri.conf.json, until the page reports its own.
+const INITIAL_SIZE: (f64, f64) = (320.0, 250.0);
 
 #[tauri::command]
 fn get_snapshot(shared: State<Shared>) -> Snapshot {
@@ -62,6 +70,12 @@ fn get_snapshot(shared: State<Shared>) -> Snapshot {
 
 #[tauri::command]
 fn refresh(shared: State<Shared>) {
+    request_refresh(&shared);
+}
+
+/// A refresh the person asked for (button, shortcut, menu), not the timer.
+fn request_refresh(shared: &Shared) {
+    providers::ask_keychain_again();
     let _ = shared.refresh.lock().unwrap().send(());
 }
 
@@ -74,21 +88,27 @@ fn hide(window: WebviewWindow) {
 /// The page tells us how big its content is; size the popover to match.
 #[tauri::command]
 fn fit(window: WebviewWindow, shared: State<Shared>, width: f64, height: f64) {
-    let size = tauri::LogicalSize::new(width.clamp(180.0, 900.0), height.clamp(120.0, 600.0));
-    let _ = window.set_size(size);
-    place(&window, *shared.anchor.lock().unwrap());
+    let size = (width.clamp(180.0, 900.0), height.clamp(120.0, 600.0));
+    *shared.size.lock().unwrap() = size;
+    let _ = window.set_size(tauri::LogicalSize::new(size.0, size.1));
+    place(&window, &shared);
 }
 
-fn place(window: &WebviewWindow, anchor: Option<Anchor>) {
-    let Ok(size) = window.outer_size() else { return };
-    let (width, height) = (size.width as f64, size.height as f64);
+/// Put the popover by the tray icon (or in a corner when there is no click
+/// position), on the monitor that icon is on.
+fn place(window: &WebviewWindow, shared: &Shared) {
+    let anchor = *shared.anchor.lock().unwrap();
+    let (logical_width, logical_height) = *shared.size.lock().unwrap();
     let monitor = anchor
         .and_then(|a| window.monitor_from_point(a.centre_x, a.top).ok().flatten())
         .or_else(|| window.primary_monitor().ok().flatten());
     let Some(monitor) = monitor else { return };
+    let scale = monitor.scale_factor();
+    // The size the window will have on that monitor, not the size it has now.
+    let (width, height) = (logical_width * scale, logical_height * scale);
     let (left, top) = (monitor.position().x as f64, monitor.position().y as f64);
     let (right, bottom) = (left + monitor.size().width as f64, top + monitor.size().height as f64);
-    let margin = 8.0 * monitor.scale_factor();
+    let margin = 8.0 * scale;
 
     let (x, y) = match anchor {
         // Tray at the top of the screen (macOS, some Linux): hang below it.
@@ -105,7 +125,7 @@ fn place(window: &WebviewWindow, anchor: Option<Anchor>) {
 
 fn show(app: &AppHandle) {
     let Some(window) = app.get_webview_window("main") else { return };
-    place(&window, *app.state::<Shared>().anchor.lock().unwrap());
+    place(&window, &app.state::<Shared>());
     let _ = window.show();
     let _ = window.set_focus();
 }
@@ -138,27 +158,133 @@ fn update_tray(app: &AppHandle, providers: &[Provider]) {
     let _ = tray.set_icon(Some(Image::new_owned(rgba, width, height)));
     let _ = tray.set_icon_as_template(template);
 
-    let lines: Vec<String> = shown
+    let _ = tray.set_tooltip(Some(tooltip(&shown, cfg!(windows))));
+}
+
+/// Windows tray tooltips hold 127 UTF-16 units, after which they are cut off.
+const WINDOWS_TOOLTIP_UNITS: usize = 127;
+
+/// One line per provider. `compact` (Windows) gives each provider only its
+/// tightest quota and no error detail, and lists problems and the providers
+/// with the least left first, so that if there are too many to fit, the
+/// lines cut off are the healthy ones.
+fn tooltip(shown: &[&Provider], compact: bool) -> String {
+    // (how urgent: lower first, line)
+    let mut lines: Vec<(f64, String)> = shown
         .iter()
         .map(|p| match (&p.error, p.quotas.is_empty()) {
-            (Some(error), _) => format!("{}: {error}", p.name),
-            (None, true) => format!("{}: no data", p.name),
+            (Some(_), _) if compact => (-1.0, format!("{}: problem", p.name)),
+            (Some(error), _) => (-1.0, format!("{}: {error}", p.name)),
+            (None, true) => (f64::INFINITY, format!("{}: no data", p.name)),
+            (None, false) if compact => {
+                let tightest = p.quotas.iter().max_by(|a, b| a.used.total_cmp(&b.used));
+                let q = tightest.expect("quotas is not empty");
+                let left = 1.0 - q.used;
+                (left, format!("{} {:.0}% left ({})", p.name, left * 100.0, q.label))
+            }
             (None, false) => {
                 let parts: Vec<String> = p
                     .quotas
                     .iter()
                     .map(|q| format!("{} {:.0}%", q.label, (1.0 - q.used) * 100.0))
                     .collect();
-                format!("{}: {} left", p.name, parts.join(", "))
+                (0.0, format!("{}: {} left", p.name, parts.join(", ")))
             }
         })
         .collect();
-    let tooltip = if lines.is_empty() {
+    if compact {
+        lines.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    let lines: Vec<String> = lines.into_iter().map(|(_, line)| line).collect();
+    let text = if lines.is_empty() {
         "Copia — no providers found".to_string()
     } else {
         lines.join("\n")
     };
-    let _ = tray.set_tooltip(Some(tooltip));
+    if compact {
+        clip_utf16(&text, WINDOWS_TOOLTIP_UNITS)
+    } else {
+        text
+    }
+}
+
+/// `text` cut to at most `max` UTF-16 units, ending in "…" when cut.
+fn clip_utf16(text: &str, max: usize) -> String {
+    if text.encode_utf16().count() <= max {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 1; // room for the ellipsis
+    for c in text.chars() {
+        used += c.len_utf16();
+        if used > max {
+            break;
+        }
+        out.push(c);
+    }
+    out.truncate(out.trim_end().len());
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use providers::Quota;
+
+    fn provider(name: &str, quotas: &[(&str, f64)], error: Option<&str>) -> Provider {
+        Provider {
+            id: name.to_lowercase(),
+            name: name.into(),
+            configured: true,
+            quotas: quotas
+                .iter()
+                .map(|&(label, used)| Quota { label: label.into(), used, resets_at: None })
+                .collect(),
+            error: error.map(String::from),
+            experimental: false,
+        }
+    }
+
+    #[test]
+    fn windows_tooltip_drops_healthy_providers_first() {
+        let mut all: Vec<Provider> = (1..=9)
+            .map(|i| provider(&format!("Custom tool {i}"), &[("day", 0.1)], None))
+            .collect();
+        all.push(provider("Nearly out", &[("day", 0.97)], None));
+        all.push(provider("Broken", &[], Some("network: no route to host")));
+        let shown: Vec<&Provider> = all.iter().collect();
+        let text = tooltip(&shown, true);
+        assert!(text.encode_utf16().count() <= WINDOWS_TOOLTIP_UNITS, "{text}");
+        assert!(text.starts_with("Broken: problem\nNearly out 3% left (day)"), "{text}");
+        assert!(text.ends_with('…'), "{text}");
+    }
+
+    #[test]
+    fn windows_tooltip_fits_four_providers() {
+        let all = [
+            provider("Claude", &[("5h", 0.38), ("week", 0.61), ("opus", 0.2), ("sonnet", 0.3)], None),
+            provider("Gemini", &[], Some("sign-in expired — run `gemini` once to renew it")),
+            provider("Codex", &[("5h", 0.12), ("week", 0.87)], None),
+            provider("OpenCode Go", &[("5h", 0.05), ("week", 0.44), ("month", 0.7)], None),
+        ];
+        let shown: Vec<&Provider> = all.iter().collect();
+        let text = tooltip(&shown, true);
+        assert!(text.encode_utf16().count() <= WINDOWS_TOOLTIP_UNITS, "{text}");
+        for p in &all {
+            assert!(text.contains(&p.name), "{text}");
+        }
+        assert!(text.contains("Claude 39% left (week)"), "{text}");
+        assert!(text.contains("Codex 13% left (week)"), "{text}");
+    }
+
+    #[test]
+    fn long_text_is_clipped_with_an_ellipsis() {
+        let clipped = clip_utf16(&"é".repeat(200), WINDOWS_TOOLTIP_UNITS);
+        assert_eq!(clipped.encode_utf16().count(), WINDOWS_TOOLTIP_UNITS);
+        assert!(clipped.ends_with('…'));
+        assert_eq!(clip_utf16("short", WINDOWS_TOOLTIP_UNITS), "short");
+    }
 }
 
 fn spawn_worker(app: AppHandle, wake: mpsc::Receiver<()>, demo: bool) {
@@ -181,10 +307,41 @@ fn spawn_worker(app: AppHandle, wake: mpsc::Receiver<()>, demo: bool) {
     });
 }
 
+/// Release builds on Windows are GUI programs with no console of their own,
+/// so `--print` run from a terminal would print nowhere. Borrow the
+/// terminal's console, unless stdout already goes somewhere (a pipe or file).
+#[cfg(windows)]
+fn attach_console() {
+    use std::ffi::c_void;
+    const STD_OUTPUT_HANDLE: u32 = -11i32 as u32;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+    const FILE_TYPE_UNKNOWN: u32 = 0;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut c_void;
+        fn GetFileType(file: *mut c_void) -> u32;
+        fn AttachConsole(process: u32) -> i32;
+    }
+    // SAFETY: GetStdHandle and AttachConsole take plain integers;
+    // GetFileType is only given a handle that is neither null nor invalid.
+    unsafe {
+        let out = GetStdHandle(STD_OUTPUT_HANDLE);
+        // No handle, or one that leads nowhere usable: borrow the console.
+        let usable = !out.is_null() && out as isize != -1 && GetFileType(out) != FILE_TYPE_UNKNOWN;
+        if !usable {
+            AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn attach_console() {}
+
 fn main() {
     let demo = std::env::args().any(|a| a == "--demo") || std::env::var_os("COPIA_DEMO").is_some();
     // `copia --print`: fetch once, print the quotas as JSON, and exit. No tray.
     if std::env::args().any(|a| a == "--print") {
+        attach_console();
         let providers = if demo { providers::demo() } else { providers::fetch_all(&Config::load()) };
         println!("{}", serde_json::to_string_pretty(&providers).unwrap_or_default());
         return;
@@ -198,6 +355,7 @@ fn main() {
             snapshot: Mutex::new(Snapshot::new(Vec::new(), None, true, demo)),
             refresh: Mutex::new(refresh_tx),
             anchor: Mutex::new(None),
+            size: Mutex::new(INITIAL_SIZE),
             hidden_at: Mutex::new(Instant::now() - Duration::from_secs(1)),
         })
         .invoke_handler(tauri::generate_handler![get_snapshot, refresh, fit, hide])
@@ -209,6 +367,18 @@ fn main() {
             WindowEvent::CloseRequested { api, .. } => {
                 api.prevent_close();
                 let _ = window.hide();
+            }
+            // Moving to a monitor with another scale factor resizes the
+            // window, and Windows moves it to its own suggested spot after
+            // this handler returns. Place it again once that is done: from
+            // another thread, the calls queue behind the resize.
+            WindowEvent::ScaleFactorChanged { .. } => {
+                let app = window.app_handle().clone();
+                std::thread::spawn(move || {
+                    if let Some(popover) = app.get_webview_window("main") {
+                        place(&popover, &app.state::<Shared>());
+                    }
+                });
             }
             _ => {}
         })
@@ -237,9 +407,7 @@ fn main() {
                 .show_menu_on_left_click(false)
                 .on_menu_event(|app, event| match event.id.as_ref() {
                     "show" => show(app),
-                    "refresh" => {
-                        let _ = app.state::<Shared>().refresh.lock().unwrap().send(());
-                    }
+                    "refresh" => request_refresh(&app.state::<Shared>()),
                     "quit" => app.exit(0),
                     _ => {}
                 })
