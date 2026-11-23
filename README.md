@@ -120,21 +120,37 @@ Copia stores nothing except an optional settings file (see [Settings](#settings)
 
 ## Status
 
-Early, and honest about it:
+Version 0.1.0 was released on 22 November 2026. It is early, and this section
+says plainly what has and has not been checked.
 
-- **Built and run on macOS only** (Apple silicon). The tray icon, the popover
-  and its layout work there.
-- **Claude and Codex have been fetched from live accounts** (22 Nov 2026).
-  Claude returned its 5-hour and weekly windows; Codex returned one weekly
-  window. **Gemini and OpenCode Go have not been tried against a real
-  account**; their code follows the endpoints listed below, so expect to fix
-  field names.
-- **macOS fullscreen:** the popover did not come on screen while another app
-  was in a fullscreen Space. It likely needs to become an `NSPanel` (see
+**Checked**
+
+- **macOS (Apple silicon):** installed and run. The tray icon, the popover and
+  its layout work.
+- **Claude and Codex:** fetched from live accounts. Claude returned its 5-hour
+  and weekly windows; Codex returned one weekly window.
+- **Builds:** every change is compiled and tested on macOS, Windows and Linux,
+  and the installers for all three are built by CI.
+
+**Not checked yet**
+
+- **Windows and Linux:** nobody has reported running the installers. If you
+  do, please [say how it went](https://github.com/potpiemuncher/copia/issues/new/choose).
+- **macOS on Intel:** the download is a universal build, but it has only been
+  run on Apple silicon.
+- **Gemini:** never tried against a real account. Its code follows the endpoint
+  listed below, so expect to fix field names.
+- **OpenCode Go:** follows OpenCode's own documentation, and the endpoint
+  answers as documented without a key, but it has never been run with a real
+  Go key. The app marks it "unverified".
+
+**Known problems**
+
+- **Not code-signed.** Windows and macOS warn on first run; see
+  [Install](#install).
+- **macOS fullscreen:** the popover does not appear while another app is in a
+  fullscreen Space. It likely needs to become an `NSPanel` (see
   `tauri-nspanel`). Outside fullscreen it shows normally.
-- **Windows and Linux installers are built and tested by CI, but nobody has
-  reported running them yet.** If you do, please
-  [say how it went](https://github.com/potpiemuncher/copia/issues/new/choose).
 
 ## What it reads
 
