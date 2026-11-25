@@ -137,7 +137,7 @@ Copia stores nothing except an optional settings file (see [Settings](#settings)
 
 ## Status
 
-Version 0.1.1 was released on 22 November 2026. It is early, and this section
+Version 0.1.2 was released on 25 November 2026. It is early, and this section
 says plainly what has and has not been checked.
 
 **Checked**

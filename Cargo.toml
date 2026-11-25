@@ -1,6 +1,6 @@
 [package]
 name = "copia"
-version = "0.1.1"
+version = "0.1.2"
 description = "Your AI coding quotas, as little bars in the menubar / system tray"
 license = "MIT"
 edition = "2021"
