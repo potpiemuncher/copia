@@ -42,9 +42,13 @@ pub struct Provider {
 #[serde(default)]
 pub struct Config {
     pub refresh_minutes: Option<u64>,
-    /// Provider ids to skip: "claude", "codex", "gemini", "opencode-go".
+    /// Provider ids to skip: "claude", "claude:<folder>", "codex", "gemini",
+    /// "opencode-go".
     pub disabled: Vec<String>,
     pub custom: Vec<Custom>,
+    /// Extra Claude Code config folders (`CLAUDE_CONFIG_DIR`) to read a
+    /// sign-in from, besides the ones Copia finds itself (see `claude_logins`).
+    pub claude_config_dirs: Vec<String>,
     /// Why config.json, or its `custom` part, was not used: it could not be
     /// read or parsed, or it could be changed by someone else. Shown in the
     /// popover so a typo does not silently drop every setting.
@@ -148,31 +152,39 @@ const EXPERIMENTAL: [&str; 1] = ["opencode-go"];
 type Fetched = Result<Option<Vec<Quota>>, String>;
 
 pub fn fetch_all(config: &Config) -> Vec<Provider> {
-    let builtin: [(&str, &str, fn() -> Fetched); 4] = [
-        ("claude", "Claude", claude),
+    let builtin: [(&str, &str, fn() -> Fetched); 3] = [
         ("codex", "Codex", codex),
         ("gemini", "Gemini", gemini),
         ("opencode-go", "OpenCode Go", opencode_go),
     ];
+    let disabled = |id: &str| config.disabled.iter().any(|d| d == id);
+    let claude_logins: Vec<ClaudeLogin> =
+        claude_logins(config).into_iter().filter(|l| !disabled(&l.id)).collect();
 
     std::thread::scope(|scope| {
+        // Ids must be unique (the popover keys its bars on them).
+        let mut taken: Vec<String> = claude_logins.iter().map(|l| l.id.clone()).collect();
+        // Every Claude sign-in comes back from one job, so they stay first
+        // and in order however many there are.
+        let claude = scope.spawn(move || claude_all(claude_logins));
         let mut jobs = Vec::new();
         for (id, name, fetch) in builtin {
-            if config.disabled.iter().any(|d| d == id) {
+            if disabled(id) {
                 continue;
             }
+            taken.push(id.to_string());
             jobs.push((id.to_string(), name.to_string(), scope.spawn(fetch)));
         }
         for custom in &config.custom {
-            // Ids must be unique (the popover keys its bars on them), even
-            // when two entries share a name.
+            // Even when two entries share a name.
             let base = format!("custom:{}", custom.name);
             let mut id = base.clone();
             let mut n = 1;
-            while jobs.iter().any(|(taken, _, _)| *taken == id) {
+            while taken.contains(&id) {
                 n += 1;
                 id = format!("{base}#{n}");
             }
+            taken.push(id.clone());
             jobs.push((id, custom.name.clone(), scope.spawn(|| run_custom(custom))));
         }
         let problem = config.problem.clone().map(|error| Provider {
@@ -183,9 +195,14 @@ pub fn fetch_all(config: &Config) -> Vec<Provider> {
             error: Some(error),
             experimental: false,
         });
-        jobs.into_iter()
-            .map(|(id, name, job)| {
-                let fetched = job.join().unwrap_or_else(|_| Err("crashed".into()));
+        let claude = claude.join().unwrap_or_default();
+        let others = jobs
+            .into_iter()
+            .map(|(id, name, job)| (id, name, job.join().unwrap_or_else(|_| Err("crashed".into()))));
+        claude
+            .into_iter()
+            .chain(others)
+            .map(|(id, name, fetched)| {
                 let (configured, quotas, error) = match fetched {
                     Ok(Some(quotas)) if quotas.is_empty() => {
                         (true, quotas, Some("no quota windows in the reply".to_string()))
@@ -248,17 +265,208 @@ pub fn demo() -> Vec<Provider> {
 
 // ---------------------------------------------------------------- Claude ---
 
-fn claude() -> Fetched {
-    let file = || read_json(dirs::home_dir()?.join(".claude/.credentials.json"));
-    let creds = match claude_keychain() {
-        Ok(Some(creds)) => Some(creds),
-        Ok(None) => file(),
-        // Keychain refused: the file may still have a login; if not, say so.
-        Err(why) => match file() {
-            Some(creds) => Some(creds),
-            None => return Err(why),
-        },
+/// One Claude Code sign-in on this machine: the default one (`~/.claude`) or
+/// one made with `CLAUDE_CONFIG_DIR=<dir> claude`, which is how people keep a
+/// work and a personal account signed in side by side.
+#[derive(Debug, Clone, PartialEq)]
+struct ClaudeLogin {
+    /// "claude" for the default sign-in, "claude:<name>" for the others.
+    id: String,
+    name: String,
+    /// macOS Keychain service names to try, in order. Claude Code names the
+    /// item after the `CLAUDE_CONFIG_DIR` text exactly as it was typed, so a
+    /// folder has more than one possible name (with or without a trailing /).
+    services: Vec<String>,
+    /// Where Claude Code keeps the sign-in when there is no Keychain.
+    file: PathBuf,
+    /// What to run to renew it.
+    cli: String,
+}
+
+const CLAUDE_SERVICE: &str = "Claude Code-credentials";
+
+/// The default sign-in first, then one per extra Claude Code config folder:
+/// `claude_config_dirs` from config.json, `$CLAUDE_CONFIG_DIR` if Copia was
+/// started with it, and any `~/.claude-*` or `~/.claude_*` folder that holds
+/// a Claude Code `.claude.json`.
+fn claude_logins(config: &Config) -> Vec<ClaudeLogin> {
+    let Some(home) = dirs::home_dir() else {
+        return Vec::new();
     };
+    let env_dir = std::env::var_os("CLAUDE_CONFIG_DIR").filter(|d| !d.is_empty()).map(PathBuf::from);
+    claude_logins_in(config, &home, env_dir)
+}
+
+fn claude_logins_in(config: &Config, home: &std::path::Path, env_dir: Option<PathBuf>) -> Vec<ClaudeLogin> {
+    let default_dir = home.join(".claude");
+    let mut logins = vec![ClaudeLogin {
+        id: "claude".into(),
+        name: "Claude".into(),
+        services: vec![CLAUDE_SERVICE.into()],
+        file: default_dir.join(".credentials.json"),
+        cli: "claude".into(),
+    }];
+
+    let mut dirs: Vec<PathBuf> = config.claude_config_dirs.iter().map(|d| expand_home(d, home)).collect();
+    dirs.extend(env_dir);
+    let mut found: Vec<PathBuf> = std::fs::read_dir(home)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            (name.starts_with(".claude-") || name.starts_with(".claude_"))
+                && entry.path().join(".claude.json").is_file()
+        })
+        .map(|entry| entry.path())
+        .collect();
+    found.sort();
+    dirs.extend(found);
+
+    let mut seen = vec![std::fs::canonicalize(&default_dir).unwrap_or(default_dir)];
+    for dir in dirs {
+        let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if seen.contains(&real) {
+            continue;
+        }
+        seen.push(real);
+        let label = claude_dir_label(&dir);
+        let base = format!("claude:{label}");
+        let mut id = base.clone();
+        let mut n = 1;
+        while logins.iter().any(|l| l.id == id) {
+            n += 1;
+            id = format!("{base}#{n}");
+        }
+        logins.push(ClaudeLogin {
+            id,
+            name: format!("Claude ({label})"),
+            services: claude_services(&dir),
+            file: dir.join(".credentials.json"),
+            cli: format!("CLAUDE_CONFIG_DIR={} claude", tilde(&dir, home)),
+        });
+    }
+    logins
+}
+
+/// "~/.claude-work" -> "work"; any other folder keeps its own name.
+fn claude_dir_label(dir: &std::path::Path) -> String {
+    let name = dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let short = name
+        .strip_prefix(".claude-")
+        .or_else(|| name.strip_prefix(".claude_"))
+        .unwrap_or(&name)
+        .trim_start_matches('.');
+    if short.is_empty() { "other".into() } else { short.into() }
+}
+
+/// Claude Code's Keychain service for a `CLAUDE_CONFIG_DIR`:
+/// "Claude Code-credentials-" plus the first 8 hex digits of the SHA-256 of
+/// the folder text. Both spellings with and without a trailing slash are
+/// tried, since Copia cannot know which one was typed.
+fn claude_services(dir: &std::path::Path) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let text = dir.to_string_lossy();
+    let bare = text.trim_end_matches(['/', '\\']);
+    let mut spellings = vec![bare.to_string(), format!("{bare}{}", std::path::MAIN_SEPARATOR)];
+    spellings.dedup();
+    spellings
+        .into_iter()
+        .map(|s| {
+            let hash = Sha256::digest(s.as_bytes());
+            let hex: String = hash.iter().take(4).map(|b| format!("{b:02x}")).collect();
+            format!("{CLAUDE_SERVICE}-{hex}")
+        })
+        .collect()
+}
+
+/// `dir` with the home folder written as ~, for messages.
+fn tilde(dir: &std::path::Path, home: &std::path::Path) -> String {
+    match dir.strip_prefix(home) {
+        Ok(rest) => format!("~/{}", rest.display()),
+        Err(_) => dir.display().to_string(),
+    }
+}
+
+fn expand_home(dir: &str, home: &std::path::Path) -> PathBuf {
+    match dir.strip_prefix("~/").or_else(|| dir.strip_prefix("~\\")) {
+        Some(rest) => home.join(rest),
+        None if dir == "~" => home.to_path_buf(),
+        None => PathBuf::from(dir),
+    }
+}
+
+/// The stored sign-in for `login`, from the Keychain or else its file.
+/// Ok(None) = no sign-in there.
+fn claude_creds(login: &ClaudeLogin) -> ClaudeCreds {
+    let file = || read_json(login.file.clone());
+    let mut refused = None;
+    for service in &login.services {
+        match claude_keychain(service) {
+            Ok(Some(creds)) => return Ok(Some(creds)),
+            Ok(None) => {}
+            Err(why) => refused = Some(why),
+        }
+    }
+    match (file(), refused) {
+        (Some(creds), _) => Ok(Some(creds)),
+        // Keychain refused and no file: say so rather than hide the bar.
+        (None, Some(why)) => Err(why),
+        (None, None) => Ok(None),
+    }
+}
+
+/// Which account a sign-in belongs to, so the same account signed in from
+/// two folders is shown once.
+fn claude_account(creds: &Value) -> Option<(String, String)> {
+    let oauth = creds.get("claudeAiOauth")?;
+    let account = oauth.get("accountUuid")?.as_str()?;
+    let org = oauth.get("organizationUuid").and_then(Value::as_str).unwrap_or("");
+    Some((account.to_string(), org.to_string()))
+}
+
+/// Fetch every Claude sign-in in `logins`: read each one's credentials (one
+/// at a time, so Keychain prompts come one after another), drop sign-ins of
+/// an account already listed and extra folders with nothing signed in, then
+/// ask for usage for the rest in parallel.
+fn claude_all(logins: Vec<ClaudeLogin>) -> Vec<(String, String, Fetched)> {
+    let ready = claude_ready(logins);
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = ready
+            .into_iter()
+            .map(|(id, name, cli, creds)| (id, name, scope.spawn(move || claude(creds, &cli))))
+            .collect();
+        jobs.into_iter()
+            .map(|(id, name, job)| (id, name, job.join().unwrap_or_else(|_| Err("crashed".into()))))
+            .collect()
+    })
+}
+
+type ClaudeCreds = Result<Option<Value>, String>;
+
+/// (id, name, renew command, credentials) for each sign-in worth showing.
+fn claude_ready(logins: Vec<ClaudeLogin>) -> Vec<(String, String, String, ClaudeCreds)> {
+    let mut accounts = Vec::new();
+    let mut ready = Vec::new();
+    for login in logins {
+        let creds = claude_creds(&login);
+        if let Ok(Some(account)) = creds.as_ref().map(|c| c.as_ref().and_then(claude_account)) {
+            if accounts.contains(&account) {
+                continue;
+            }
+            accounts.push(account);
+        }
+        if login.id != "claude" && matches!(creds, Ok(None)) {
+            continue;
+        }
+        ready.push((login.id, login.name, login.cli, creds));
+    }
+    ready
+}
+
+fn claude(creds: ClaudeCreds, cli: &str) -> Fetched {
+    let creds = creds?;
     let token = match creds
         .as_ref()
         .and_then(|c| c.pointer("/claudeAiOauth/accessToken"))
@@ -275,7 +483,7 @@ fn claude() -> Fetched {
             .set("anthropic-beta", "oauth-2025-04-20"),
         None,
     )
-    .map_err(|e| stale(e, "claude"))?;
+    .map_err(|e| stale(e, cli))?;
 
     let windows = [
         ("five_hour", "5h"),
@@ -300,32 +508,33 @@ fn claude() -> Fetched {
 /// On macOS Claude Code keeps its login in the Keychain. It is read through
 /// Security.framework, so macOS asks on Copia's behalf and an "Always Allow"
 /// trusts Copia's own binary. (Running `/usr/bin/security` instead would make
-/// that approval cover every program that can run `security`.)
+/// that approval cover every program that can run `security`.) Each sign-in
+/// is its own item, so each is asked about once.
 ///
 /// If the person clicks Deny, asking again on every timed refresh would bring
-/// the dialog back every few minutes, so Copia stops asking until they press
-/// Refresh (see `ask_keychain_again`).
+/// the dialog back every few minutes, so Copia stops asking for that item
+/// until they press Refresh (see `ask_keychain_again`).
 #[cfg(target_os = "macos")]
-fn claude_keychain() -> Result<Option<Value>, String> {
+fn claude_keychain(service: &str) -> Result<Option<Value>, String> {
     use security_framework::item::{ItemClass, ItemSearchOptions, SearchResult};
-    use std::sync::atomic::Ordering;
     const DENIED: &str = "Keychain access denied — press Refresh to be asked again";
     // errSecUserCanceled, errSecAuthFailed: the person said no.
     const REFUSALS: [i32; 2] = [-128, -25293];
 
-    if KEYCHAIN_DENIED.load(Ordering::Relaxed) {
+    let denied = || KEYCHAIN_DENIED.lock().unwrap_or_else(|e| e.into_inner());
+    if denied().iter().any(|s| s == service) {
         return Err(DENIED.into());
     }
     let found = match ItemSearchOptions::new()
         .class(ItemClass::generic_password())
-        .service("Claude Code-credentials")
+        .service(service)
         .load_data(true)
         .limit(1)
         .search()
     {
         Ok(found) => found,
         Err(e) if REFUSALS.contains(&e.code()) => {
-            KEYCHAIN_DENIED.store(true, Ordering::Relaxed);
+            denied().push(service.to_string());
             return Err(DENIED.into());
         }
         // Not found, locked, no UI available…: try the file instead.
@@ -338,18 +547,19 @@ fn claude_keychain() -> Result<Option<Value>, String> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn claude_keychain() -> Result<Option<Value>, String> {
+fn claude_keychain(_service: &str) -> Result<Option<Value>, String> {
     Ok(None)
 }
 
+/// Keychain items the person has refused this session.
 #[cfg(target_os = "macos")]
-static KEYCHAIN_DENIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KEYCHAIN_DENIED: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 
 /// The person asked for a refresh: if they once denied Keychain access, let
 /// the next fetch ask again.
 pub fn ask_keychain_again() {
     #[cfg(target_os = "macos")]
-    KEYCHAIN_DENIED.store(false, std::sync::atomic::Ordering::Relaxed);
+    KEYCHAIN_DENIED.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 // ----------------------------------------------------------------- Codex ---
@@ -1000,5 +1210,116 @@ mod opencode_go_tests {
         let quotas = opencode_go_quotas(&reply);
         assert_eq!(quotas.len(), 1);
         assert_eq!(quotas[0].resets_at, None);
+    }
+}
+
+#[cfg(test)]
+mod claude_tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("copia-claude-test-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn keychain_service_matches_claude_code() {
+        // Claude Code: "Claude Code-credentials-" + sha256(CLAUDE_CONFIG_DIR)[..8].
+        let sep = std::path::MAIN_SEPARATOR;
+        let services = claude_services(std::path::Path::new("/Users/someone/.claude-work"));
+        assert_eq!(services[0], "Claude Code-credentials-18cc900a");
+        if sep == '/' {
+            assert_eq!(services[1], "Claude Code-credentials-fb460960");
+        }
+        // A trailing slash in the folder gives the same two names.
+        assert_eq!(claude_services(std::path::Path::new("/Users/someone/.claude-work/")), services);
+    }
+
+    #[test]
+    fn folder_labels() {
+        let label = |p: &str| claude_dir_label(std::path::Path::new(p));
+        assert_eq!(label("/h/.claude-work"), "work");
+        assert_eq!(label("/h/.claude_personal"), "personal");
+        assert_eq!(label("/srv/claude-team"), "claude-team");
+        assert_eq!(label("/h/.claude-"), "other");
+    }
+
+    #[test]
+    fn finds_extra_config_folders_once() {
+        let home = scratch("home");
+        for name in [".claude", ".claude-work", ".claude-empty", ".claude_personal", ".clauderc"] {
+            std::fs::create_dir_all(home.join(name)).unwrap();
+        }
+        // Only folders Claude Code has used (they hold .claude.json) count.
+        for name in [".claude-work", ".claude_personal", ".clauderc"] {
+            std::fs::write(home.join(name).join(".claude.json"), "{}").unwrap();
+        }
+        let elsewhere = scratch("elsewhere");
+        let config = Config {
+            // Named in config.json and also found by the scan: listed once.
+            claude_config_dirs: vec!["~/.claude-work".into(), elsewhere.to_string_lossy().into_owned()],
+            ..Config::default()
+        };
+        // $CLAUDE_CONFIG_DIR pointing at the default folder adds nothing.
+        let logins = claude_logins_in(&config, &home, Some(home.join(".claude")));
+        let ids: Vec<&str> = logins.iter().map(|l| l.id.as_str()).collect();
+        let elsewhere_id = format!("claude:{}", claude_dir_label(&elsewhere));
+        assert_eq!(ids, ["claude", "claude:work", elsewhere_id.as_str(), "claude:personal"]);
+        assert_eq!(logins[0].services, [CLAUDE_SERVICE]);
+        assert_eq!(logins[1].name, "Claude (work)");
+        assert_eq!(logins[1].file, home.join(".claude-work/.credentials.json"));
+        assert_eq!(logins[1].services, claude_services(&home.join(".claude-work")));
+        assert_eq!(logins[1].cli, "CLAUDE_CONFIG_DIR=~/.claude-work claude");
+        std::fs::remove_dir_all(&home).unwrap();
+        std::fs::remove_dir_all(&elsewhere).unwrap();
+    }
+
+    #[test]
+    fn same_account_twice_is_shown_once_and_empty_folders_are_dropped() {
+        let dir = scratch("dedup");
+        let login = |id: &str, account: Option<&str>| {
+            let file = dir.join(format!("{}.json", id.replace(':', "_")));
+            if let Some(account) = account {
+                let creds = json!({ "claudeAiOauth": {
+                    "accessToken": "t", "accountUuid": account, "organizationUuid": "org"
+                }});
+                std::fs::write(&file, creds.to_string()).unwrap();
+            }
+            ClaudeLogin {
+                id: id.into(),
+                name: id.into(),
+                // No such Keychain item, so the file is read.
+                services: vec![format!("copia-test-missing-{}", std::process::id())],
+                file,
+                cli: "claude".into(),
+            }
+        };
+        let ready = claude_ready(vec![
+            login("claude", Some("work")),
+            login("claude:work", Some("work")),
+            login("claude:personal", Some("personal")),
+            login("claude:empty", None),
+        ]);
+        let ids: Vec<&str> = ready.iter().map(|(id, ..)| id.as_str()).collect();
+        assert_eq!(ids, ["claude", "claude:personal"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn signed_out_default_still_reports_not_set_up() {
+        let dir = scratch("signed-out");
+        let ready = claude_ready(vec![ClaudeLogin {
+            id: "claude".into(),
+            name: "Claude".into(),
+            services: vec![format!("copia-test-missing-{}", std::process::id())],
+            file: dir.join(".credentials.json"),
+            cli: "claude".into(),
+        }]);
+        assert_eq!(ready.len(), 1);
+        let (.., cli, creds) = ready.into_iter().next().unwrap();
+        assert!(matches!(claude(creds, &cli), Ok(None)));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

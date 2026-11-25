@@ -60,6 +60,10 @@ of providers.
   sign-in that vendor's own CLI left on the machine and asks that vendor's
   usage endpoint. Only OpenCode Go's endpoint is documented by its vendor; the
   others are what the vendors' own tools call and can change without notice.
+- Claude can have several sign-ins: the default `~/.claude` one and one per
+  extra Claude Code config folder (`CLAUDE_CONFIG_DIR`), each shown as its own
+  provider, such as "Claude (personal)". The Claude desktop app's sign-in is
+  not read.
 - A provider with no sign-in on the machine is left out. A provider whose
   fetch fails shows its error in place of its bars.
 - Each quota has a short label ("5h", "week", "pro"), a used fraction and an

@@ -94,6 +94,22 @@ command-line app is already signed in **on this computer**:
 If none are signed in, the popover says so. Sign in with one, then click
 **Refresh**.
 
+### More than one Claude account
+
+Claude Code keeps one sign-in per config folder, so to have a work and a
+personal account side by side, sign the second one in to its own folder:
+
+```bash
+CLAUDE_CONFIG_DIR=~/.claude-personal claude
+```
+
+Copia finds every `~/.claude-*` (or `~/.claude_*`) folder that Claude Code has
+used and shows each signed-in account as its own row, such as
+**Claude (personal)**. A folder elsewhere can be added with
+`claude_config_dirs` in the settings below. The same account signed in from
+two folders is shown once. The Claude desktop app's own sign-in is not read:
+it keeps it encrypted for itself.
+
 ### Uninstall
 
 - **Windows:** Settings → Apps → Installed apps → Copia → Uninstall.
@@ -162,7 +178,7 @@ is sent only to the vendor it belongs to.
 
 | Tool | Credential it reads | Asks |
 | --- | --- | --- |
-| Claude | macOS Keychain item `Claude Code-credentials`, else `~/.claude/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
+| Claude | macOS Keychain item `Claude Code-credentials`, else `~/.claude/.credentials.json`. Each extra config folder: item `Claude Code-credentials-<8 hex of SHA-256 of the folder>`, else `<folder>/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
 | Codex / ChatGPT | `~/.codex/auth.json` (or `$CODEX_HOME`) | `chatgpt.com/backend-api/wham/usage` |
 | Gemini CLI | `~/.gemini/oauth_creds.json` | `cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota` |
 | OpenCode Go | `$OPENCODE_API_KEY`, else `~/.local/share/opencode/auth.json` | `opencode.ai/inference/go/v1/usage` |
@@ -170,7 +186,7 @@ is sent only to the vendor it belongs to.
 Things to know:
 
 - On macOS the first Claude fetch makes the system ask whether Copia may read
-  the Keychain item. Choose *Always Allow* or it asks every refresh (after a
+  the Keychain item (once per Claude account). Choose *Always Allow* or it asks every refresh (after a
   *Deny* it waits until you press Refresh). The
   approval is for Copia's own signed app only, so a rebuilt development binary
   asks again. (Versions before this one asked on behalf of `/usr/bin/security`,
@@ -203,13 +219,20 @@ defaults and shows the reason under **Settings** in the popover.
 {
   "refresh_minutes": 5,
   "disabled": ["gemini"],
+  "claude_config_dirs": ["/Volumes/Work/claude-config"],
   "custom": [
     { "name": "My tool", "command": ["/path/to/script"] }
   ]
 }
 ```
 
-Provider ids for `disabled`: `claude`, `codex`, `gemini`, `opencode-go`.
+Provider ids for `disabled`: `claude`, `codex`, `gemini`, `opencode-go`, and
+`claude:<name>` for an extra Claude folder (`claude:personal` for
+`~/.claude-personal`).
+
+`claude_config_dirs` lists extra Claude Code config folders that are not
+`~/.claude-*`. Write each one exactly as you set `CLAUDE_CONFIG_DIR`, since
+Claude Code names its Keychain item after that text.
 
 A **custom** provider is any program that prints quotas as JSON, with `used` or
 `remaining` as a fraction from 0 to 1 and `resets_at` as epoch seconds or an
