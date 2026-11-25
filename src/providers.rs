@@ -152,6 +152,12 @@ const EXPERIMENTAL: [&str; 1] = ["opencode-go"];
 type Fetched = Result<Option<Vec<Quota>>, String>;
 
 pub fn fetch_all(config: &Config) -> Vec<Provider> {
+    fetch_all_with(config, claude_logins(config))
+}
+
+/// `fetch_all` with the Claude sign-ins already found, so tests can leave
+/// out the ones on the machine running them.
+fn fetch_all_with(config: &Config, claude_logins: Vec<ClaudeLogin>) -> Vec<Provider> {
     let builtin: [(&str, &str, fn() -> Fetched); 3] = [
         ("codex", "Codex", codex),
         ("gemini", "Gemini", gemini),
@@ -159,7 +165,7 @@ pub fn fetch_all(config: &Config) -> Vec<Provider> {
     ];
     let disabled = |id: &str| config.disabled.iter().any(|d| d == id);
     let claude_logins: Vec<ClaudeLogin> =
-        claude_logins(config).into_iter().filter(|l| !disabled(&l.id)).collect();
+        claude_logins.into_iter().filter(|l| !disabled(&l.id)).collect();
 
     std::thread::scope(|scope| {
         // Ids must be unique (the popover keys its bars on them).
@@ -1181,7 +1187,9 @@ mod tests {
             custom: vec![custom("Team"), custom("Team"), custom("Other")],
             ..Config::default()
         };
-        let ids: Vec<String> = fetch_all(&config).into_iter().map(|p| p.id).collect();
+        // No Claude sign-ins: whatever this machine has signed in (and its
+        // Keychain) stays out of the test.
+        let ids: Vec<String> = fetch_all_with(&config, Vec::new()).into_iter().map(|p| p.id).collect();
         assert_eq!(ids, ["custom:Team", "custom:Team#2", "custom:Other"]);
     }
 }
