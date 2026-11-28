@@ -58,9 +58,10 @@ of providers.
 
 - Built-in providers: Claude, Codex, Antigravity (`agy`), OpenCode Go. Each reuses
   the sign-in that vendor's own CLI left on the machine (with Antigravity queried
-  via `agy -p /usage --output-format json`) and asks that vendor's usage source.
-  Only OpenCode Go's endpoint is documented by its vendor; the others are what
-  the vendors' own tools call and can change without notice.
+  via `agy -p /usage --output-format json`, and OpenCode Go via
+  `opencode api get /api/experimental/usage/limits`) and asks that vendor's usage
+  source. Only OpenCode Go's endpoints are documented by its vendor; the others
+  are what the vendors' own tools call and can change without notice.
 - Claude can have several sign-ins: the default `~/.claude` one and one per
   extra Claude Code config folder (`CLAUDE_CONFIG_DIR`), each shown as its own
   provider, such as "Claude (personal)". The Claude desktop app's sign-in is
@@ -75,12 +76,10 @@ of providers.
 - Terminology: "provider" (a tool/vendor), "quota" (one window of one
   provider), "left" / "remaining" for the fraction shown.
 - Not built: OpenCode Zen balance, Cursor, Copilot.
-- A provider nobody has run against a live account is flagged experimental
-  and shown as "unverified" in the popover. Today that is OpenCode Go.
+- No built-in provider is flagged experimental today; all four have been run
+  against live accounts.
 - Known gap: on macOS the popover does not appear over another app's
   fullscreen Space.
-- Known gap: OpenCode v2 keeps credentials in a SQLite database Copia does not
-  read; those users must set `OPENCODE_API_KEY`.
 - Undecided: whether Copia ever refreshes expired tokens itself; whether it
   gains alerts, history or cost estimates.
 
@@ -104,11 +103,11 @@ of providers.
   https://github.com/potpiemuncher/copia/releases with installers for Windows,
   macOS (universal) and Linux, plus SHA-256 checksums.
 - Verified by use: macOS on Apple silicon; Claude and Codex against live
-  accounts (22 November 2026), and Antigravity (24 November 2026, agy 1.5.16).
-- Not verified: Windows, Linux and Intel Macs have never been run by anyone;
-  OpenCode Go has never been run with a real account. Any claim
-  that Copia "works with" one of these must carry that caveat until it is
-  confirmed.
+  accounts (22 November 2026), Antigravity (24 November 2026, agy 1.5.16) and
+  OpenCode Go (27 November 2026, opencode 2.4.1).
+- Not verified: Windows, Linux and Intel Macs have never been run by anyone.
+  Any claim that Copia "works with" one of these must carry that caveat until
+  it is confirmed.
 - Turned in on Rainshare on 22 November 2026; not yet marked done by the
   person who asked.
 - No users beyond the maintainer, testimonials, download numbers or benchmarks

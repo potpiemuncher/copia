@@ -129,8 +129,6 @@ Copia stores nothing except an optional settings file (see [Settings](#settings)
   limits is close". On macOS it is a template image that follows the menubar
   colour; elsewhere bars are purple, amber below 50% and red below 20%.
 - Hover the icon for the numbers as text.
-- A provider marked **unverified** in the popover is one whose request or reply
-  code has not been run against a live account (currently OpenCode Go).
 - The popover follows the system light / dark theme, redraws its bars in
   system colours under Windows High Contrast, and exposes each bar to screen
   readers as a meter ("week: 39% left, resets in 3d").
@@ -144,9 +142,11 @@ says plainly what has and has not been checked.
 
 - **macOS (Apple silicon):** installed and run. The tray icon, the popover and
   its layout work.
-- **Claude, Codex and Antigravity:** fetched from live accounts. Claude
-  returned its 5-hour and weekly windows; Codex returned one weekly window;
-  Antigravity (`agy 1.5.16`) returned its Gemini and third-party model windows.
+- **Claude, Codex, Antigravity and OpenCode Go:** fetched from live accounts.
+  Claude returned its 5-hour and weekly windows; Codex returned one weekly
+  window; Antigravity (`agy 1.5.16`) returned its Gemini and third-party model
+  windows; OpenCode Go (`opencode 2.4.1`) returned its 5-hour, weekly and
+  monthly windows.
 - **Builds:** every change is compiled and tested on macOS, Windows and Linux,
   and the installers for all three are built by CI.
 
@@ -156,9 +156,6 @@ says plainly what has and has not been checked.
   do, please [say how it went](https://github.com/potpiemuncher/copia/issues/new/choose).
 - **macOS on Intel:** the download is a universal build, but it has only been
   run on Apple silicon.
-- **OpenCode Go:** follows OpenCode's own documentation, and the endpoint
-  answers as documented without a key, but it has never been run with a real
-  Go key. The app marks it "unverified".
 
 **Known problems**
 
@@ -180,7 +177,7 @@ is sent only to the vendor it belongs to.
 | Claude | macOS Keychain item `Claude Code-credentials`, else `~/.claude/.credentials.json`. Each extra config folder: item `Claude Code-credentials-<8 hex of SHA-256 of the folder>`, else `<folder>/.credentials.json` | `api.anthropic.com/api/oauth/usage` |
 | Codex / ChatGPT | `~/.codex/auth.json` (or `$CODEX_HOME`) | `chatgpt.com/backend-api/wham/usage` |
 | Antigravity | Runs the signed-in `agy` CLI: `$ANTIGRAVITY_CLI_PATH`, else `PATH`, else `/opt/homebrew/bin`, `/usr/local/bin` or `~/.local/bin` (Windows: `%LOCALAPPDATA%\agy\bin\agy.exe`). Runs it only if there is a sign-in: `$AGY_ADC_AUTH` or `enableAdc` in `~/.gemini/config/config.json`, else on macOS the Keychain item `gemini` / account `antigravity` (only whether it exists; its secret is not read, so this does not prompt), else (Linux, Windows, or no Keychain) `~/.gemini/antigravity-cli/cache/onboarding.json` | `agy -p /usage --output-format json` |
-| OpenCode Go | `$OPENCODE_API_KEY`, else `~/.local/share/opencode/auth.json` | `opencode.ai/inference/go/v1/usage` |
+| OpenCode Go | `$OPENCODE_API_KEY`, else the signed-in `opencode` CLI (v2), else `~/.local/share/opencode/auth.json` | `opencode api get /api/experimental/usage/limits`, or `opencode.ai/inference/go/v1/usage` |
 
 Things to know:
 
@@ -201,9 +198,10 @@ Things to know:
   Copia stops `agy` as soon as it asks for a sign-in rather than letting it
   wait for a code.
 - OpenCode Go is the one provider with a vendor-documented usage endpoint, and
-  Copia follows that documentation, but it has not been run with a real Go
-  key. OpenCode v2 keeps credentials in a SQLite database Copia does not read,
-  so if `auth.json` is missing or stale, set `OPENCODE_API_KEY` to your Go key.
+  Copia follows that documentation. OpenCode v1 kept the Go key in
+  `auth.json`; OpenCode v2 keeps credentials in its own store, so Copia asks
+  the signed-in `opencode` CLI (`opencode api get
+  /api/experimental/usage/limits`). `OPENCODE_API_KEY` overrides both.
 - **Not built yet:** OpenCode Zen balance, Cursor, Copilot. Use a
   custom command (below) or send a patch to `src/providers.rs`; a provider is
   one function.

@@ -18,7 +18,7 @@
       { label: "other 5h", used: 0.0, resets_at: null },
       q("other wk", 0.15, 432000),
     ]),
-    p("OpenCode Go", [q("5h", 0.05, 3600), q("week", 0.44, 172800), q("month", 1, 900000)], { experimental: true }),
+    p("OpenCode Go", [q("5h", 0.05, 3600), q("week", 0.44, 172800), q("month", 1, 900000)]),
     p("Cursor", [], { configured: false }),
   ];
   if (location.search.includes("stress")) {

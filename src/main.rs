@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, State, WebviewWindow, WindowEvent};
+use tauri::{AppHandle, Emitter, Manager, State, WebviewWindow, WindowEvent};
 
 const TRAY_ID: &str = "copia";
 
@@ -40,7 +40,8 @@ impl Snapshot {
     }
 }
 
-/// Where the tray icon is, in physical pixels, so the popover can sit by it.
+/// Where the tray icon is, in logical points on macOS and physical pixels elsewhere,
+/// so the popover can sit by it.
 #[derive(Clone, Copy)]
 struct Anchor {
     centre_x: f64,
@@ -94,22 +95,17 @@ fn fit(window: WebviewWindow, shared: State<Shared>, width: f64, height: f64) {
     place(&window, &shared);
 }
 
-/// Put the popover by the tray icon (or in a corner when there is no click
-/// position), on the monitor that icon is on.
-fn place(window: &WebviewWindow, shared: &Shared) {
-    let anchor = *shared.anchor.lock().unwrap();
-    let (logical_width, logical_height) = *shared.size.lock().unwrap();
-    let monitor = anchor
-        .and_then(|a| window.monitor_from_point(a.centre_x, a.top).ok().flatten())
-        .or_else(|| window.primary_monitor().ok().flatten());
-    let Some(monitor) = monitor else { return };
-    let scale = monitor.scale_factor();
-    // The size the window will have on that monitor, not the size it has now.
-    let (width, height) = (logical_width * scale, logical_height * scale);
-    let (left, top) = (monitor.position().x as f64, monitor.position().y as f64);
-    let (right, bottom) = (left + monitor.size().width as f64, top + monitor.size().height as f64);
-    let margin = 8.0 * scale;
-
+/// Compute the popover's top-left `(x, y)` inside `bounds = (left, top, right, bottom)`
+/// given `anchor`, `size = (width, height)`, and `margin` — all in the same
+/// coordinate unit (logical points on macOS, physical pixels elsewhere).
+fn popover_origin(
+    anchor: Option<Anchor>,
+    bounds: (f64, f64, f64, f64),
+    size: (f64, f64),
+    margin: f64,
+) -> (f64, f64) {
+    let (left, top, right, bottom) = bounds;
+    let (width, height) = size;
     let (x, y) = match anchor {
         // Tray at the top of the screen (macOS, some Linux): hang below it.
         Some(a) if a.top < top + (bottom - top) / 2.0 => (a.centre_x - width / 2.0, a.bottom + margin / 2.0),
@@ -120,7 +116,80 @@ fn place(window: &WebviewWindow, shared: &Shared) {
     };
     let x = x.clamp(left + margin, (right - width - margin).max(left + margin));
     let y = y.clamp(top, (bottom - height - margin).max(top));
-    let _ = window.set_position(PhysicalPosition::new(x, y));
+    (x, y)
+}
+
+/// Put the popover by the tray icon (or in a corner when there is no click
+/// position), on the monitor that icon is on.
+fn place(window: &WebviewWindow, shared: &Shared) {
+    let anchor = *shared.anchor.lock().unwrap();
+    let (logical_width, logical_height) = *shared.size.lock().unwrap();
+    let monitor = anchor
+        .and_then(|a| window.monitor_from_point(a.centre_x, a.top).ok().flatten())
+        .or_else(|| window.primary_monitor().ok().flatten());
+    let Some(monitor) = monitor else { return };
+    let scale = monitor.scale_factor();
+
+    #[cfg(target_os = "macos")]
+    {
+        // On macOS, `monitor_from_point`, `Anchor`, and `LogicalPosition` all
+        // operate in global logical points; `set_position(PhysicalPosition)`
+        // would rescale by the window's *previous* monitor's scale factor.
+        let left = monitor.position().x as f64 / scale;
+        let top = monitor.position().y as f64 / scale;
+        let right = left + monitor.size().width as f64 / scale;
+        let bottom = top + monitor.size().height as f64 / scale;
+        let (x, y) = popover_origin(
+            anchor,
+            (left, top, right, bottom),
+            (logical_width, logical_height),
+            8.0,
+        );
+        let _ = window.set_position(tauri::LogicalPosition::new(x, y));
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        // The size the window will have on that monitor, not the size it has now.
+        let (width, height) = (logical_width * scale, logical_height * scale);
+        let (left, top) = (monitor.position().x as f64, monitor.position().y as f64);
+        let (right, bottom) = (left + monitor.size().width as f64, top + monitor.size().height as f64);
+        let (x, y) = popover_origin(anchor, (left, top, right, bottom), (width, height), 8.0 * scale);
+        let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
+    }
+}
+
+fn tray_anchor(app: &AppHandle, rect: &tauri::Rect) -> Anchor {
+    let position = rect.position.to_physical::<f64>(1.0);
+    let size = rect.size.to_physical::<f64>(1.0);
+
+    #[cfg(target_os = "macos")]
+    {
+        let primary = app.primary_monitor().ok().flatten();
+        let primary_scale = primary.as_ref().map(|m| m.scale_factor()).unwrap_or(1.0);
+        let scale = app
+            .cursor_position()
+            .ok()
+            .and_then(|c| app.monitor_from_point(c.x / primary_scale, c.y / primary_scale).ok().flatten())
+            .or(primary)
+            .map(|m| m.scale_factor())
+            .unwrap_or(1.0);
+        Anchor {
+            centre_x: (position.x + size.width / 2.0) / scale,
+            top: position.y / scale,
+            bottom: (position.y + size.height) / scale,
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = app;
+        Anchor {
+            centre_x: position.x + size.width / 2.0,
+            top: position.y,
+            bottom: position.y + size.height,
+        }
+    }
 }
 
 fn show(app: &AppHandle) {
@@ -285,6 +354,52 @@ mod tests {
         assert!(clipped.ends_with('…'));
         assert_eq!(clip_utf16("short", WINDOWS_TOOLTIP_UNITS), "short");
     }
+
+    #[test]
+    fn popover_origin_sits_below_menubar_on_primary_and_secondary_displays() {
+        // Primary 2x Retina display in logical points: (0, 0) .. (1512, 982)
+        let anchor = Anchor { centre_x: 1200.0, top: 0.0, bottom: 24.0 };
+        let (x, y) = popover_origin(Some(anchor), (0.0, 0.0, 1512.0, 982.0), (320.0, 250.0), 8.0);
+        assert_eq!((x, y), (1040.0, 28.0));
+
+        // Secondary 1x display to the right: (1512, 0) .. (3432, 1080)
+        let right_anchor = Anchor { centre_x: 2900.0, top: 0.0, bottom: 24.0 };
+        let (x, y) = popover_origin(
+            Some(right_anchor),
+            (1512.0, 0.0, 3432.0, 1080.0),
+            (320.0, 250.0),
+            8.0,
+        );
+        assert_eq!((x, y), (2740.0, 28.0));
+
+        // Secondary display to the left and above (negative x and y)
+        let neg_anchor = Anchor { centre_x: -400.0, top: -1080.0, bottom: -1056.0 };
+        let (x, y) = popover_origin(
+            Some(neg_anchor),
+            (-1920.0, -1080.0, 0.0, 0.0),
+            (320.0, 250.0),
+            8.0,
+        );
+        assert_eq!((x, y), (-560.0, -1052.0));
+    }
+
+    #[test]
+    fn popover_origin_clamps_near_screen_edges_and_sits_above_bottom_tray() {
+        // Near right edge of a 1512pt display: clamped to right - width - margin = 1184
+        let right_edge = Anchor { centre_x: 1490.0, top: 0.0, bottom: 24.0 };
+        let (x, y) = popover_origin(Some(right_edge), (0.0, 0.0, 1512.0, 982.0), (320.0, 250.0), 8.0);
+        assert_eq!((x, y), (1184.0, 28.0));
+
+        // Near left edge: clamped to left + margin = 8
+        let left_edge = Anchor { centre_x: 20.0, top: 0.0, bottom: 24.0 };
+        let (x, y) = popover_origin(Some(left_edge), (0.0, 0.0, 1512.0, 982.0), (320.0, 250.0), 8.0);
+        assert_eq!((x, y), (8.0, 28.0));
+
+        // Bottom taskbar (Windows): sits above the tray icon
+        let bottom_tray = Anchor { centre_x: 1700.0, top: 1032.0, bottom: 1080.0 };
+        let (x, y) = popover_origin(Some(bottom_tray), (0.0, 0.0, 1920.0, 1080.0), (320.0, 250.0), 8.0);
+        assert_eq!((x, y), (1540.0, 778.0));
+    }
 }
 
 fn spawn_worker(app: AppHandle, wake: mpsc::Receiver<()>, demo: bool) {
@@ -420,13 +535,7 @@ fn main() {
                     } = event
                     {
                         let app = tray.app_handle();
-                        let position = rect.position.to_physical::<f64>(1.0);
-                        let size = rect.size.to_physical::<f64>(1.0);
-                        *app.state::<Shared>().anchor.lock().unwrap() = Some(Anchor {
-                            centre_x: position.x + size.width / 2.0,
-                            top: position.y,
-                            bottom: position.y + size.height,
-                        });
+                        *app.state::<Shared>().anchor.lock().unwrap() = Some(tray_anchor(app, &rect));
                         toggle(app);
                     }
                 })

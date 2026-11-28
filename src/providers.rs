@@ -147,7 +147,7 @@ fn check_private(_path: &std::path::Path, _file: &std::fs::File) -> Result<(), S
 }
 
 /// Providers nobody has run against a live account yet.
-const EXPERIMENTAL: [&str; 1] = ["opencode-go"];
+const EXPERIMENTAL: [&str; 0] = [];
 
 /// Ok(None) = not set up on this machine; Err = set up but the fetch failed.
 type Fetched = Result<Option<Vec<Quota>>, String>;
@@ -1023,59 +1023,175 @@ fn antigravity_reset(value: &Value) -> Option<Value> {
 
 // ----------------------------------------------------------- OpenCode Go ---
 
-/// Endpoint and reply shape are OpenCode's documented ones
-/// (https://opencode.ai/docs, "Go" page: `GET /inference/go/v1/usage`), but
-/// nobody has run this against a live Go subscription yet.
-fn opencode_go() -> Fetched {
-    // The key is the Go API key. OpenCode v1 kept it in auth.json; v2 keeps
-    // credentials in a SQLite database Copia does not read, so v2-only users
-    // need OPENCODE_API_KEY set.
-    let key = std::env::var("OPENCODE_API_KEY").ok().filter(|k| !k.is_empty()).or_else(|| {
-        let data = match std::env::var_os("XDG_DATA_HOME") {
-            Some(dir) => PathBuf::from(dir),
-            None => dirs::home_dir()?.join(".local/share"),
-        };
-        let auth = read_json(data.join("opencode/auth.json"))?;
-        let entry = &auth["opencode-go"];
-        Some(entry["key"].as_str().or_else(|| entry["access"].as_str())?.to_string())
-    });
-    let Some(key) = key else {
-        return Ok(None);
-    };
+/// Find the `opencode` CLI: `PATH` first, then the folders a GUI app on
+/// macOS (which starts with a minimal `PATH`) would otherwise miss.
+fn find_opencode() -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH");
 
+    #[cfg(unix)]
+    let fallbacks: Vec<PathBuf> = {
+        let home = dirs::home_dir();
+        [
+            Some(PathBuf::from("/opt/homebrew/bin/opencode")),
+            Some(PathBuf::from("/usr/local/bin/opencode")),
+            home.as_ref().map(|home| home.join(".local/bin/opencode")),
+            home.as_ref().map(|home| home.join(".opencode/bin/opencode")),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    };
+    #[cfg(windows)]
+    let fallbacks: Vec<PathBuf> = dirs::data_local_dir()
+        .map(|dir| dir.join("Programs").join("opencode").join("opencode.exe"))
+        .into_iter()
+        .collect();
+
+    find_opencode_in(path_var.as_deref(), &fallbacks)
+}
+
+fn find_opencode_in(
+    path_var: Option<&std::ffi::OsStr>,
+    fallbacks: &[PathBuf],
+) -> Option<PathBuf> {
+    let exe = if cfg!(windows) { "opencode.exe" } else { "opencode" };
+    if let Some(path_var) = path_var {
+        for dir in std::env::split_paths(path_var) {
+            let candidate = dir.join(exe);
+            if is_executable_file(&candidate) {
+                return Some(std::fs::canonicalize(&candidate).unwrap_or(candidate));
+            }
+        }
+    }
+    fallbacks
+        .iter()
+        .find(|path| is_executable_file(path))
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| path.clone()))
+}
+
+/// Endpoint and reply shape are OpenCode's documented ones
+/// (https://opencode.ai/docs, "Go" page: `GET /inference/go/v1/usage`). When
+/// credentials live in OpenCode v2's own store instead of `auth.json`, ask the
+/// v2 CLI, which reports the same meters under `data.go`.
+fn opencode_go() -> Fetched {
+    // An explicit key always wins: it names the account to ask about.
+    if let Some(key) = std::env::var("OPENCODE_API_KEY").ok().filter(|key| !key.is_empty()) {
+        return opencode_go_http(&key);
+    }
+
+    // OpenCode v2 keeps credentials in a SQLite database Copia does not read,
+    // and exposes Go usage through its own CLI.
+    let mut cli_error = None;
+    if let Some(path) = find_opencode() {
+        match opencode_go_cli(&path) {
+            Ok(Some(quotas)) => return Ok(Some(quotas)),
+            // The CLI is signed in but has no Go subscription; the legacy
+            // auth.json may still name one.
+            Ok(None) => {}
+            Err(error) => cli_error = Some(error),
+        }
+    }
+
+    if let Some(key) = opencode_legacy_key() {
+        return opencode_go_http(&key);
+    }
+
+    match cli_error {
+        Some(error) => Err(error),
+        None => Ok(None),
+    }
+}
+
+/// The Go key OpenCode v1 left in `auth.json`.
+fn opencode_legacy_key() -> Option<String> {
+    let data = match std::env::var_os("XDG_DATA_HOME") {
+        Some(dir) => PathBuf::from(dir),
+        None => dirs::home_dir()?.join(".local/share"),
+    };
+    let auth = read_json(data.join("opencode/auth.json"))?;
+    let entry = &auth["opencode-go"];
+    Some(entry["key"].as_str().or_else(|| entry["access"].as_str())?.to_string())
+}
+
+/// Ask the signed-in OpenCode v2 CLI for the same meters.
+fn opencode_go_cli(path: &Path) -> Fetched {
+    use std::io::IsTerminal;
+    // In a terminal (`copia --print`), leave the CLI in the terminal's
+    // process group; see `run_limited`.
+    let own_group = !std::io::stdin().is_terminal();
+    let command = vec![
+        path.to_string_lossy().into_owned(),
+        "api".into(),
+        "get".into(),
+        "/api/experimental/usage/limits".into(),
+    ];
+    let stdout = run_limited(&command, CUSTOM_TIMEOUT, own_group)?;
+    let reply: Value = serde_json::from_slice(&stdout)
+        .map_err(|error| format!("opencode output is not JSON: {error}"))?;
+    if reply["data"]["go"].is_object() {
+        Ok(Some(opencode_go_quotas(&reply)))
+    } else {
+        Ok(None)
+    }
+}
+
+fn opencode_go_http(key: &str) -> Fetched {
     let reply = send(
         agent()
             .get("https://opencode.ai/inference/go/v1/usage")
             .set("Authorization", &format!("Bearer {key}")),
     )
-    .map_err(|e| {
-        if e.starts_with("HTTP 401") {
+    .map_err(|error| {
+        if error.starts_with("HTTP 401") {
             "OpenCode did not accept this API key".to_string()
-        } else if e.starts_with("HTTP 403") {
+        } else if error.starts_with("HTTP 403") {
             "this key has no OpenCode Go subscription".to_string()
         } else {
-            e
+            error
         }
     })?;
     Ok(Some(opencode_go_quotas(&reply)))
 }
 
-/// `{"usage": {"rolling": {"status", "percent", "resetsAt"}, "weekly", "monthly"}}`
-/// where `percent` is 0–100 *used* and `resetsAt` is ISO-8601.
+/// OpenCode's meters: `rolling`, `weekly`, `monthly`, each with `percent`
+/// (0–100 *used*) and `resetsAt`. The v2 CLI nests them under `data.go`; the
+/// legacy HTTP endpoint uses `usage`.
 fn opencode_go_quotas(reply: &Value) -> Vec<Quota> {
+    let meters = match &reply["data"]["go"] {
+        go @ Value::Object(_) => go,
+        _ => &reply["usage"],
+    };
     let windows = [("rolling", "5h"), ("weekly", "week"), ("monthly", "month")];
     let mut quotas = Vec::new();
     for (key, label) in windows {
-        let meter = &reply["usage"][key];
+        let meter = &meters[key];
         if let Some(percent) = meter["percent"].as_f64() {
             quotas.push(Quota {
                 label: label.into(),
                 used: fraction(percent / 100.0),
-                resets_at: some(&meter["resetsAt"]),
+                resets_at: opencode_go_reset(&meter["resetsAt"]),
             });
         }
     }
     quotas
+}
+
+/// `Quota.resets_at` is epoch seconds or ISO-8601. The legacy HTTP endpoint
+/// sends ISO-8601, and the v2 CLI sends epoch milliseconds; convert those to
+/// epoch seconds. Zero and negative resets mean "no reset time".
+fn opencode_go_reset(value: &Value) -> Option<Value> {
+    match value {
+        Value::String(text) if !text.is_empty() => Some(value.clone()),
+        Value::Number(_) => {
+            let seconds = value.as_f64()?;
+            if !seconds.is_finite() || seconds <= 0.0 {
+                return None;
+            }
+            let seconds = if seconds >= 1_000_000_000_000.0 { seconds / 1000.0 } else { seconds };
+            Some(json!(seconds as u64))
+        }
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------- Custom ---
@@ -1675,6 +1791,121 @@ mod opencode_go_tests {
         let quotas = opencode_go_quotas(&reply);
         assert_eq!(quotas.len(), 1);
         assert_eq!(quotas[0].resets_at, None);
+    }
+
+    /// What `opencode api get /api/experimental/usage/limits` prints on
+    /// OpenCode v2: meters under `data.go`, resets in epoch milliseconds.
+    #[test]
+    fn opencode_go_v2_cli_reply() {
+        let reply = json!({ "location": { "directory": "/home/me" }, "data": { "go": {
+            "rolling": { "percent": 0, "limited": false, "resetsAt": 1_795_527_276_960u64 },
+            "weekly": { "percent": 1, "limited": false, "resetsAt": 1_795_996_800_000u64 },
+            "monthly": { "percent": 38, "limited": false, "resetsAt": 1_797_493_654_000u64 }
+        }}});
+        let quotas = opencode_go_quotas(&reply);
+        let seen: Vec<(&str, f64)> = quotas.iter().map(|q| (q.label.as_str(), q.used)).collect();
+        assert_eq!(seen, [("5h", 0.0), ("week", 0.01), ("month", 0.38)]);
+        let resets: Vec<Option<Value>> = quotas.iter().map(|q| q.resets_at.clone()).collect();
+        assert_eq!(
+            resets,
+            [
+                Some(json!(1_795_527_276u64)),
+                Some(json!(1_795_996_800u64)),
+                Some(json!(1_797_493_654u64))
+            ]
+        );
+    }
+
+    #[test]
+    fn opencode_go_no_subscription_is_empty() {
+        let reply = json!({ "location": { "directory": "/home/me" }, "data": { "go": null } });
+        assert!(opencode_go_quotas(&reply).is_empty());
+    }
+
+    #[test]
+    fn opencode_go_zero_reset_is_none() {
+        let reply = json!({ "usage": { "rolling": { "percent": 5, "resetsAt": 0 } } });
+        let quotas = opencode_go_quotas(&reply);
+        assert_eq!(quotas[0].resets_at, None);
+    }
+
+    #[cfg(unix)]
+    fn fake_opencode(dir: &ProbeDir, payload: &Value) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = dir.0.join("opencode");
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{payload}'\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_go_cli_reads_v2_reply() {
+        let dir = ProbeDir::create().unwrap();
+        let script = fake_opencode(
+            &dir,
+            &json!({ "data": { "go": {
+                "rolling": { "percent": 12, "resetsAt": 1_795_527_276_960u64 },
+                "weekly": { "percent": 34, "resetsAt": 1_795_996_800_000u64 },
+                "monthly": { "percent": 56, "resetsAt": 1_797_493_654_000u64 }
+            }}}),
+        );
+        let quotas = opencode_go_cli(&script).unwrap().expect("data.go is a Go subscription");
+        let seen: Vec<(&str, f64)> = quotas.iter().map(|q| (q.label.as_str(), q.used)).collect();
+        assert_eq!(seen, [("5h", 0.12), ("week", 0.34), ("month", 0.56)]);
+        assert_eq!(quotas[1].resets_at, Some(json!(1_795_996_800u64)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opencode_go_cli_without_go_subscription_is_none() {
+        let dir = ProbeDir::create().unwrap();
+        let script = fake_opencode(&dir, &json!({ "data": { "go": null } }));
+        assert!(opencode_go_cli(&script).unwrap().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_opencode_skips_non_executable_and_uses_fallbacks() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = ProbeDir::create().unwrap();
+        let bad = dir.0.join("bad");
+        let good = dir.0.join("good");
+        let fallback_dir = dir.0.join("fallback");
+        for folder in [&bad, &good, &fallback_dir] {
+            std::fs::create_dir_all(folder).unwrap();
+        }
+
+        let non_exec = bad.join("opencode");
+        std::fs::write(&non_exec, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&non_exec, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let exec = good.join("opencode");
+        std::fs::write(&exec, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let path_env = std::env::join_paths([&bad, &good]).unwrap();
+        assert_eq!(
+            find_opencode_in(Some(path_env.as_os_str()), &[]),
+            Some(std::fs::canonicalize(&exec).unwrap())
+        );
+
+        let fallback = fallback_dir.join("opencode");
+        std::fs::write(&fallback, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&fallback, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let bad_path = std::env::join_paths([&bad]).unwrap();
+        assert_eq!(
+            find_opencode_in(Some(bad_path.as_os_str()), std::slice::from_ref(&fallback)),
+            Some(std::fs::canonicalize(&fallback).unwrap())
+        );
+
+        assert_eq!(
+            find_opencode_in(Some(path_env.as_os_str()), &[fallback]),
+            Some(std::fs::canonicalize(&exec).unwrap())
+        );
+        assert_eq!(find_opencode_in(None, &[]), None);
     }
 }
 
